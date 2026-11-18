@@ -169,14 +169,99 @@ const PAGE_HELPERS = `
 /** 检测：页面横向溢出。 */
 export async function detectHorizontalScroll(page, opts = {}) {
   const tolerance = opts.tolerance ?? DETECTORS.horizontalScroll.defaults.tolerance
-  const info = await page.evaluate(() => ({
-    scrollWidth: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
-    clientWidth: document.documentElement.clientWidth,
-    viewportWidth: window.innerWidth
-  }))
+  const info = await page.evaluate(`(() => {
+    ${PAGE_HELPERS}
+    const clientWidth = document.documentElement.clientWidth;
+    const docScrollWidth = Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0);
+
+    /**
+     * 找出真正把页面撑宽的元凶。
+     *
+     * 只报「html / body 超了 246px」用户拿不到任何线索：一半的页面都有
+     * 一句 position:absolute 的装饰、一个 min-width 的表格、一段不换行的
+     * 代码块。要指出具体是哪个元素、多宽、超出多少。
+     *
+     * 从「右边界超过视口」的元素里挑最靠外的那个 —— 它就是撑开的源头；
+     * 它的祖先通常只是被动跟着变宽，报祖先等于没报。
+     */
+    const culprits = [];
+    for (const el of Array.from(document.querySelectorAll('body *'))) {
+      if (el === document.body) continue;
+      if (!__visible(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      const overhang = r.right - clientWidth;
+      if (overhang <= 1) continue;
+      const cs = getComputedStyle(el);
+      // 自己开了横向滚动的容器是「局部滚动」，是有意为之，不算页面横向溢出
+      if (cs.overflowX === 'auto' || cs.overflowX === 'scroll') continue;
+      const parent = el.parentElement;
+      const parentOverhang = parent ? parent.getBoundingClientRect().right - clientWidth : 0;
+      // 只留「比父级更外扩」的：父级也被撑宽时，源头在父级
+      if (parent && parentOverhang >= overhang - 1) continue;
+      culprits.push({
+        selector: __path(el),
+        label: __label(el),
+        rect: __rect(el),
+        width: Math.round(r.width),
+        overhang: Math.round(overhang),
+        css: (() => {
+          // 说清楚「凭什么这么宽」，用户才知道改哪一行。
+          //
+          // 注意 getComputedStyle().width 永远返回已解析的像素值，不会等于
+          // 'auto' —— 所以不能拿它判断「有没有写死宽度」，否则 min-width 和
+          // nowrap 撑开的元素都会被误报成 width: 1100px。
+          // 先判真正起约束作用的那条，最后才退回 width。
+          const hasText = (el.textContent || '').trim().length > 0
+          if (cs.whiteSpace === 'nowrap' && hasText) return 'white-space: nowrap'
+          if (cs.minWidth && cs.minWidth !== 'auto' && cs.minWidth !== '0px') return 'min-width: ' + cs.minWidth
+          if (cs.position === 'absolute' || cs.position === 'fixed') return 'position: ' + cs.position
+          const inlineWidth = el.style && el.style.width
+          if (inlineWidth) return 'width: ' + inlineWidth
+          if (r.width >= clientWidth) return 'width: ' + Math.round(r.width) + 'px'
+          return ''
+        })()
+      });
+    }
+    culprits.sort((a, b) => b.overhang - a.overhang);
+    return {
+      scrollWidth: docScrollWidth,
+      clientWidth,
+      viewportWidth: window.innerWidth,
+      culprits: culprits.slice(0, 6)
+    };
+  })()`)
   const overflow = info.scrollWidth - info.clientWidth
   if (overflow <= tolerance) return []
-  return [{ kind: 'horizontalScroll', severity: overflow > 40 ? 'error' : 'warn', title: `页面横向超出 ${overflow}px`, detail: `页面可滚动宽度 ${info.scrollWidth}px，视口宽度 ${info.clientWidth}px；窄屏上可能出现意外横向滚动。`, target: 'html / body', suggestion: '检查固定宽度、最小宽度、绝对定位和不可换行内容；让内容随视口收缩或在局部容器内滚动。', metrics: { ...info, overflow } }]
+
+  const top = info.culprits[0]
+  // 找到源头就报源头：可点击、能框出来、给得出具体建议。
+  // 找不到才退回 html/body —— 这时确实没有单一元素可指。
+  if (top) {
+    return [{
+      kind: 'horizontalScroll',
+      severity: overflow > 40 ? 'error' : 'warn',
+      title: `页面横向超出 ${overflow}px`,
+      detail: `页面可滚动宽度 ${info.scrollWidth}px，视口宽度 ${info.clientWidth}px；窄屏上可能出现意外横向滚动。最外扩的元素是 ${top.selector}（宽 ${top.width}px，超出 ${top.overhang}px）${top.css ? `，${top.css}` : ''}。`,
+      target: top.selector,
+      label: top.label,
+      rect: top.rect,
+      suggestion: top.css
+        ? `这个元素写着 ${top.css}，是它把页面撑宽的。改成随视口收缩（如 max-width:100%、flex-wrap、允许换行），或让它在局部容器内横向滚动。`
+        : '检查这个元素的固定宽度、最小宽度、绝对定位和不可换行内容；让它随视口收缩或在局部容器内滚动。',
+      metrics: { ...info, overflow }
+    }]
+  }
+
+  return [{
+    kind: 'horizontalScroll',
+    severity: overflow > 40 ? 'error' : 'warn',
+    title: `页面横向超出 ${overflow}px`,
+    detail: `页面可滚动宽度 ${info.scrollWidth}px，视口宽度 ${info.clientWidth}px；窄屏上可能出现意外横向滚动。没找到单一撑宽的元素，很可能是多处内容叠加。`,
+    target: 'html / body',
+    suggestion: '检查固定宽度、最小宽度、绝对定位和不可换行内容；让内容随视口收缩或在局部容器内滚动。',
+    metrics: { ...info, overflow }
+  }]
 }
 
 /** 检测：文字溢出裁切。 */

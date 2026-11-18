@@ -128,10 +128,20 @@
 
 ## 安装
 
+在 Desktop 的「工作台 › 市场」里搜索「找茬工作台」直接安装，装完重启 Harness。
+
+也可以从 Release 手动装：下载对应版本的 `.tgz`，在 Desktop 的「已安装的工作台」里选择该文件安装，重启 Harness。
+
+从源码装（开发者）：
+
 ```bash
-pnpm pack
+git clone https://github.com/JokerGHB/ux-workbench.git
+cd ux-workbench
+pnpm install && pnpm pack
 # 然后在 Desktop 的「已安装的工作台」里安装生成的 .tgz，重启 Harness
 ```
+
+首次运行检测时需要本机有 Edge 或 Chrome，工作台会自己找。驱动用 `playwright-core`，已作为依赖声明，不需要另外装浏览器内核。
 
 数据落在 `dshHomePath('ux-workbench')`：`instances.json` 与 `runs/`。卸载工作台不删用户数据。
 

@@ -4,27 +4,16 @@ node_modules/
 # 打包产物：npm pack 生成，不入库
 *.tgz
 
-# 旧版本快照：git 从这次提交起本身就是历史，不再重复保存。
-# 磁盘上保留，不删。
-.backup-installed/
-
 # 空目录，git 不跟踪；保留占位只为说明来源
 .probe/
 src/
-
-# 被 shell 重定向写坏的空文件（文件名本身是命令残片）
-console.log(up 5599))
-{if(e){res.writeHead(404)
 
 # 临时与草稿产物
 *.tmp-*
 *.log
 .probe-*
-# 被截断/为空的 diff 导出残片
-diff-*.txt
 
-# 点开头的临时调试脚本：注释编码已损坏，且硬编码本机路径，
-# 换机器就跑不了。正式测试在 test/ 下。磁盘上保留，不删。
+# 点开头的临时调试脚本：硬编码本机路径，换机器就跑不了。
+# 正式测试在 test/ 下。
 .test-*.mjs
 .verify-ui-failed.mjs
-.server.mjs

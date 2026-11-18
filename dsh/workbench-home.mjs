@@ -261,12 +261,28 @@ export async function adoptHome(ctx, root, requested) {
     adoptedAt: new Date().toISOString()
   })
 
-  // 标题尽量贴近用户语言；登记名不参与路径解析，失败也不影响使用。
-  try {
-    if (workspaceId && workspace?.title !== HOME_TITLE) await registry.rename(workspaceId, HOME_TITLE)
-  } catch { /* 改名失败不影响目录本身 */ }
+  // 标题只在「我们自己新建的默认目录」上补一个中文名。
+  //
+  // 用户在界面里挑了已有文件夹，那个名字是他自己起的，必须原样保留 ——
+  // 强行改成「体验测试」会让人认不出这是自己刚建的那个。宿主 create()
+  // 本来就用目录名做默认标题，用户选的目录不需要我们插手。
+  if (created && basename(canonical) === HOME_DIRECTORY) {
+    try {
+      if (workspaceId && workspace?.title !== HOME_TITLE) await registry.rename(workspaceId, HOME_TITLE)
+    } catch { /* 改名失败不影响目录本身 */ }
+  }
 
   return { path: canonical, workspaceId, created }
+}
+
+/**
+ * 取路径的最后一段。
+ * @param path 绝对路径。
+ * @returns 目录名。
+ */
+function basename(path) {
+  const parts = String(path).split(/[\\/]/).filter(Boolean)
+  return parts[parts.length - 1] || String(path)
 }
 
 /**

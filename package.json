@@ -40,7 +40,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dsh-workbench/DSHUxWorkbench.git"
+    "url": "git+https://github.com/JokerGHB/ux-workbench.git"
+  },
+  "homepage": "https://github.com/JokerGHB/ux-workbench#readme",
+  "bugs": {
+    "url": "https://github.com/JokerGHB/ux-workbench/issues"
   },
   "dsh": {
     "bundle": {
