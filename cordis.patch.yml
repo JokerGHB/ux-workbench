@@ -1,0 +1,7 @@
+# 找茬工作台：把服务端入口插入 Harness 插件树。
+# root 指向 DSH 数据目录下的 ux-workbench，用于保存检测实例、模板与运行记录。
+- insert:
+    - id: dsh-ux-workbench
+      name: dsh-ux-workbench
+      config:
+        root: !!js dshHomePath('ux-workbench')

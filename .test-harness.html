@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>UX 工作台组件测试</title>
+<style>
+  :root{
+    --dsw-alias-bg-base:#fbfbfc; --dsw-alias-bg-layer-1:#fff; --dsw-alias-bg-layer-2:#f5f6f8;
+    --dsw-alias-border-l2:#e3e5e9; --dsw-alias-label-primary:#1c1d21; --dsw-alias-label-secondary:#5a5c63;
+    --dsw-alias-label-tertiary:#8b8d95; --dsw-alias-interactive-bg-hover:#eceef2;
+    --dsw-alias-state-error-primary:#d9534f; --dsw-alias-state-warning-primary:#c8860d;
+    /* 宿主主题里的品牌色。少了它，图标背景那条 gradient 会整条失效，
+       测试就看不到真实外观（曾经因此漏掉一个「图标不显示」的问题）。 */
+    --dsw-alias-state-business-primary:#0F9C87;
+  }
+  html,body{margin:0;height:100%;font:13px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;background:#fbfbfc;color:#1c1d21}
+  #root{height:100%;display:flex;flex-direction:column}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script>
+// 复刻宿主的模块装载协议：把 lib/client.js 通过 __ModuleLoader__ 喂进去
+window.__ModuleLoader__ = {
+  mods: {},
+  load({ id, factory }) {
+    const require = (name) => {
+      if (name === 'react') return window.React
+      if (name === 'react-dom') return window.ReactDOM
+      throw new Error('unknown dep: ' + name)
+    }
+    this.mods[id] = factory(require)
+  }
+}
+</script>
+<script src="http://127.0.0.1:5599/lib/client.js"></script>
+<script>
+// 拦截工作台的 API：用一份假项目数据把文件树和代码查看喂起来
+const FAKE_TREE = {
+  '': [
+    { name: 'src', path: 'src', dir: true, size: 0, kind: 'dir', hasChildren: true },
+    { name: 'index.html', path: 'index.html', dir: false, size: 1240, kind: 'code', hasChildren: false },
+    { name: 'package.json', path: 'package.json', dir: false, size: 620, kind: 'config', hasChildren: false },
+    { name: 'README.md', path: 'README.md', dir: false, size: 3100, kind: 'text', hasChildren: false }
+  ],
+  src: [
+    { name: 'app.js', path: 'src/app.js', dir: false, size: 2140, kind: 'code', hasChildren: false },
+    { name: 'style.css', path: 'src/style.css', dir: false, size: 880, kind: 'code', hasChildren: false }
+  ]
+}
+const FAKE_FILES = {
+  'src/app.js': 'import { mount } from "./runtime.js"\n\nexport function start(root) {\n  const app = mount(root)\n  app.on("ready", () => {\n    console.log("app ready")\n  })\n  return app\n}\n',
+  'src/style.css': ':root {\n  --brand: #0f9c87;\n}\n\nbody {\n  margin: 0;\n  font-family: system-ui, sans-serif;\n}\n',
+  'index.html': '<!doctype html>\n<html>\n  <head><title>Demo</title></head>\n  <body><div id="app"></div></body>\n</html>\n',
+  'package.json': '{\n  "name": "demo",\n  "version": "1.0.0"\n}\n',
+  'README.md': '# Demo\n\nA sample project.\n'
+}
+const realFetch = window.fetch
+window.fetch = async (input, init) => {
+  const url = typeof input === 'string' ? input : input.url
+  const json = (v) => new Response(JSON.stringify(v), { status: 200, headers: { 'content-type': 'application/json' } })
+
+  if (url.includes('/instances')) {
+    return json({
+      instances: [
+        {
+          id: 'inst-demo', name: 'demo-project', url: 'http://127.0.0.1:5599',
+          projectPath: 'D:/demo', devServer: null, description: '',
+          detectors: null, viewports: [], themes: null, builtin: false,
+          createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+        },
+        {
+          id: 'inst-other', name: 'other-project', url: 'http://127.0.0.1:5601',
+          projectPath: 'D:/other', devServer: null, description: '',
+          detectors: null, viewports: [], themes: null, builtin: false,
+          createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+        }
+      ]
+    })
+  }
+  if (url.includes('/health')) return json({ browser: 'msedge', driver: true })
+  if (url.includes('/runs')) {
+    return json({
+      runs: [
+        {
+          id: 'run-a', instanceName: 'demo-project', startedAt: new Date(Date.now() - 300000).toISOString(),
+          finishedAt: new Date().toISOString(), durationMs: 27200, ok: true,
+          summary: { total: 53, places: 17 }, combinations: []
+        },
+        // 真的测完、0 处缺陷 —— 这条才配显示 ✓
+        {
+          id: 'run-clean', instanceName: 'demo-project', startedAt: new Date(Date.now() - 240000).toISOString(),
+          finishedAt: new Date().toISOString(), durationMs: 9100, ok: true,
+          summary: { total: 0, places: 0 }, combinations: []
+        },
+        // 页面没打开 —— 缺陷数同样是 0，但绝不能显示 ✓
+        {
+          id: 'run-failed', instanceName: 'demo-project', startedAt: new Date(Date.now() - 180000).toISOString(),
+          finishedAt: new Date().toISOString(), durationMs: 2100, ok: false,
+          error: '无法打开页面：页面返回了错误状态码（http://127.0.0.1:5173/）。服务在响应，但返回的是错误页（常见的是 404）。',
+          summary: { total: 0, places: 0 }, combinations: []
+        }
+      ]
+    })
+  }
+  if (url.includes('/files')) {
+    const p = new URL(url, location.origin).searchParams.get('path') || ''
+    return json({ ok: true, root: 'D:/demo', path: p, entries: FAKE_TREE[p] || [] })
+  }
+  if (url.includes('/file?')) {
+    const p = new URL(url, location.origin).searchParams.get('path') || ''
+    const text = FAKE_FILES[p]
+    if (text === undefined) return new Response(JSON.stringify({ error: '没有这个文件' }), { status: 404 })
+    return json({ ok: true, path: p, name: p.split('/').pop(), size: text.length, binary: false, text })
+  }
+  if (url.includes('/run-detail')) {
+    const id = new URL(url, location.origin).searchParams.get('id') || ''
+    // 失败的检测：ok=false、没有 issues、带原因。
+    // 面板必须把它画成「没测成」，而不是绿色的「本次没有发现缺陷」。
+    if (id === 'run-failed') {
+      return json({
+        run: {
+          id: 'run-failed', instanceName: 'demo-project', url: 'http://127.0.0.1:5173/',
+          startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), durationMs: 2100,
+          ok: false,
+          error: '无法打开页面：页面返回了错误状态码（http://127.0.0.1:5173/）。服务在响应，但返回的是错误页（常见的是 404）。',
+          plan: null, issues: [], summary: { total: 0, places: 0, hits: 0 }, combinations: []
+        }
+      })
+    }
+    // 真测完且干净的一条
+    if (id === 'run-clean') {
+      return json({
+        run: {
+          id: 'run-clean', instanceName: 'demo-project', url: 'http://127.0.0.1:5599',
+          startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), durationMs: 9100,
+          ok: true, plan: { supportsDark: false, viewports: [{ label: '桌面' }], detectors: ['overflow'], discoveredStates: 2, summary: '桌面 · 亮色' },
+          issues: [], summary: { total: 0, places: 0, hits: 0 }, combinations: [{ label: '桌面 · 亮色', issueCount: 0 }]
+        }
+      })
+    }
+    return json({
+      run: {
+        id: 'run-a', instanceName: 'demo-project', url: 'http://127.0.0.1:5599',
+        startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), durationMs: 27200,
+        ok: true, plan: { supportsDark: false, viewports: [{ label: '桌面' }], detectors: ['overflow'], discoveredStates: 3, summary: '桌面 · 亮色' },
+        issues: [
+          { kind: 'overflow', title: '文字溢出', detail: '内容宽度 420px 超过容器 360px', target: '.card > h3', suggestion: '给容器加 overflow-wrap:anywhere', severity: 'warning', rect: null, hits: 3, combos: ['桌面 · 亮色'], states: [] },
+          { kind: 'tapTarget', title: '点击热区偏小', detail: '按钮为 32×32px，小于 44px', target: 'button.icon', suggestion: '把热区做到至少 44×44px', severity: 'error', rect: null, hits: 1, combos: ['桌面 · 亮色'], states: [] }
+        ],
+        summary: { total: 2, places: 2, hits: 4 }, combinations: [{ label: '桌面 · 亮色', issueCount: 2 }]
+      }
+    })
+  }
+  return json({ ok: true })
+}
+
+const mod = window.__ModuleLoader__.mods['dsh-ux-workbench']
+
+let registered = null
+const zh = (ns, dict) => dict
+
+const ctx = {
+  effect(fn) { try { fn() } catch (e) { console.error('effect failed', e) } return () => {} },
+  locale: {
+    register(ns, dict) { registered = dict },
+    bind(ns) { return (key) => (registered && registered.zh ? (registered.zh[key] ?? key) : key) }
+  },
+  desktopWorkbenches: {
+    register(opts, Panel) {
+      window.__Panel = Panel
+      const root = ReactDOM.createRoot(document.getElementById('root'))
+      root.render(React.createElement('div', { style: { flex: '1 1 auto', minHeight: 0, display: 'flex' } },
+        React.createElement(Panel, { service: null, conversation: null })))
+    }
+  }
+}
+mod.apply(ctx)
+</script>
+</body>
+</html>

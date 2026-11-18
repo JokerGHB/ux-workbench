@@ -1,0 +1,84 @@
+{
+  "name": "dsh-ux-workbench",
+  "version": "0.3.0",
+  "displayName": "找茬工作台",
+  "description": "找茬工作台：添加本地项目文件夹，或直接输入网址检测。网址只进历史记录，不进项目栏。右侧是内置浏览器，实时显示你的页面；点一条问题会跳过去并框出对应元素。引擎自动判断主题能力、展开可交互状态，测量文字溢出、暗色残留、点击热区、对比度、焦点、响应延迟与动画掉帧。",
+  "type": "module",
+  "main": "./dsh/index.js",
+  "exports": {
+    ".": "./dsh/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "dsh/index.js",
+    "dsh/engine.js",
+    "dsh/explore.js",
+    "dsh/preview.js",
+    "dsh/project.js",
+    "dsh/errors.js",
+    "dsh/cancel.js",
+    "dsh/templates.js",
+    "dsh/files.js",
+    "dsh/demo.html",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "dsh/workbench-home.mjs"
+  ],
+  "license": "MIT",
+  "author": "找茬工作台",
+  "keywords": [
+    "dsh-plugin",
+    "workbench",
+    "ux",
+    "visual-regression",
+    "playwright",
+    "找茬"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dsh-workbench/DSHUxWorkbench.git"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "dsh-desktop-workbenches",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "dependencies": {
+    "playwright-core": "^1.65.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.1 <5.0.0",
+    "@deepseek-ai/dsh-client-connection": ">=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-client-locale": ">=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/schemastery": ">=3.18.4 <3.20.0",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.1 <0.3.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "check": "node scripts/check-package.mjs",
+    "pack": "npm pack"
+  }
+}
