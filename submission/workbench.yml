@@ -1,0 +1,11 @@
+url: https://github.com/JokerGHB/ux-workbench
+name: 找茬工作台
+category: development
+description:
+  zh: 在真实浏览器里测量页面的体验缺陷，报出文字溢出、点击热区过小、暗色残留、对比度不足、键盘焦点不可见、响应延迟和动画掉帧，并给出可点的位置与修法。
+  en: Measures real-browser experience defects — text overflow, tap targets that are too small, light leftovers in dark mode, low contrast, invisible keyboard focus, slow feedback, and dropped animation frames — then points at the exact element and explains how to fix it.
+screenshots:
+  - https://raw.githubusercontent.com/JokerGHB/ux-workbench/main/docs/screenshots/01-report.png
+  - https://raw.githubusercontent.com/JokerGHB/ux-workbench/main/docs/screenshots/02-outcomes.png
+  - https://raw.githubusercontent.com/JokerGHB/ux-workbench/main/docs/screenshots/03-clean.png
+tarball: https://github.com/JokerGHB/ux-workbench/releases/latest/download/dsh-ux-workbench.tgz
