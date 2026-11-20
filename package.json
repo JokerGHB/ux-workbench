@@ -1,6 +1,6 @@
 {
   "name": "dsh-ux-workbench",
-  "version": "0.3.0",
+  "version": "0.4.2",
   "displayName": "找茬工作台",
   "description": "找茬工作台：添加本地项目文件夹，或直接输入网址检测。网址只进历史记录，不进项目栏。右侧是内置浏览器，实时显示你的页面；点一条问题会跳过去并框出对应元素。引擎自动判断主题能力、展开可交互状态，测量文字溢出、暗色残留、点击热区、对比度、焦点、响应延迟与动画掉帧。",
   "type": "module",
@@ -26,7 +26,9 @@
     "cordis.patch.yml",
     "README.md",
     "LICENSE",
-    "dsh/workbench-home.mjs"
+    "dsh/workbench-home.mjs",
+    "dsh/agent-persona.mjs",
+    "skills/ux-experience-check/SKILL.md"
   ],
   "license": "MIT",
   "author": "找茬工作台",

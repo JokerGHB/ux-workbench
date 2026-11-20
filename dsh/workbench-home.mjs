@@ -151,15 +151,62 @@ async function writeHomeRecord(root, record) {
 }
 
 /**
- * 取宿主的工作区登记表。
+ * 取宿主的「工作区命令」服务。
+ *
+ * 必须是 workspaceController，**不是** workspaceRegistry —— 这是踩过的坑：
+ *
+ * workspaceRegistry.create() 只把目录登记进权威表，不产生任何 RPC 结果。
+ * 而左侧列表是客户端的 ClientWorkspaceModel，它的 create() 在拿到 unary
+ * 结果后才会 `upsert(result.value.workspace)` 把新行插进列表。直接调
+ * registry 的结果就是：磁盘建了、登记表里也有了，但左侧工作区列表里
+ * 什么都看不到，用户以为没生效。
+ *
+ * workspaceController 注册为 remote 命名空间 `workspace`，它的 create()
+ * 走的正是 WorkspaceCommands —— 和界面自己点「新建工作区」是同一条路，
+ * 所以左侧会立刻出现这个文件夹，也就能在里面新建对话。
+ *
  * @param ctx 宿主上下文。
- * @returns 登记表服务，或 null（旧宿主）。
+ * @returns 控制器服务，或 null（旧宿主）。
  */
 function registryOf(ctx) {
-  try {
-    const registry = typeof ctx?.get === 'function' ? ctx.get('workspaceRegistry') : ctx?.workspaceRegistry
-    if (registry && typeof registry.create === 'function') return registry
-  } catch { /* 服务不存在时按不可用处理 */ }
+  const lookup = (name) => {
+    try {
+      return typeof ctx?.get === 'function' ? ctx.get(name) : ctx?.[name]
+    } catch { return undefined }
+  }
+  // 首选控制器的 create；它才会让界面列表刷新。
+  // modern=true 表示 create 收 { path } 且返回 { workspace, created }。
+  const controller = lookup('workspaceController')
+  if (controller && typeof controller.create === 'function') return { service: controller, modern: true }
+  // 退一步才用登记表：至少能建目录和记录，只是列表可能要重开才看得到。
+  // 旧登记表 create 收路径字符串、直接返回实体 —— 调用形态必须区分开，
+  // 否则回退路径会在 path.split 上炸掉（这条被单元测试抓到过）。
+  const registry = lookup('workspaceRegistry')
+  if (registry && typeof registry.create === 'function') return { service: registry, modern: false }
+  return undefined
+}
+
+/**
+ * 按路径查这个目录是否已经被登记成工作区。
+ *
+ * 不能拿 controller 干这事：workspaceController 只暴露 create/rename/delete/
+ * follow 等命令，没有 resolveByPath。真正有 resolveByPath 的是更底层的
+ * workspaceRegistry。这里单独取它，只在「够不够用得着提示用户」这个只读
+ * 判断上用，不参与创建。
+ *
+ * @param ctx 宿主上下文。
+ * @returns 解析函数，或 null。
+ */
+function pathResolverOf(ctx) {
+  const lookup = (name) => {
+    try {
+      return typeof ctx?.get === 'function' ? ctx.get(name) : ctx?.[name]
+    } catch { return undefined }
+  }
+  const registry = lookup('workspaceRegistry')
+  if (registry && typeof registry.resolveByPath === 'function') {
+    return (path) => registry.resolveByPath(path)
+  }
   return null
 }
 
@@ -189,7 +236,7 @@ export async function describeHome(ctx, root) {
   if (!record) {
     const probe = suggested ? await probePath(suggested) : { exists: false, isDirectory: false }
     return {
-      available: Boolean(registry),
+      available: Boolean(registry && registry.service),
       adopted: false,
       path: suggested,
       title: HOME_TITLE,
@@ -198,21 +245,22 @@ export async function describeHome(ctx, root) {
       needsConfirmation: probe.exists,
       oneDrive,
       suggestionError,
-      reason: registry ? '' : '当前版本不支持创建工作区，请手动选择已有文件夹。'
+      reason: registry && registry.service ? '' : '当前版本不支持创建工作区，请手动选择已有文件夹。'
     }
   }
 
   const probe = await probePath(record.path)
   let registered = false
-  if (registry) {
+  const resolvePath = pathResolverOf(ctx)
+  if (resolvePath) {
     try {
-      const entity = await registry.resolveByPath(record.path)
+      const entity = await resolvePath(record.path)
       registered = entity !== undefined
     } catch { /* 路径没了或没登记，都按未登记处理 */ }
   }
 
   return {
-    available: Boolean(registry),
+    available: Boolean(registry && registry.service),
     adopted: probe.exists && probe.isDirectory,
     path: record.path,
     title: HOME_TITLE,
@@ -223,7 +271,7 @@ export async function describeHome(ctx, root) {
     // 目录被用户删掉或挪走时要提示重建，而不是静默重新建一个。
     missing: !probe.exists,
     registered,
-    reason: registry ? '' : '当前版本不支持创建工作区，请手动选择已有文件夹。'
+    reason: registry && registry.service ? '' : '当前版本不支持创建工作区，请手动选择已有文件夹。'
   }
 }
 
@@ -238,7 +286,7 @@ export async function describeHome(ctx, root) {
  */
 export async function adoptHome(ctx, root, requested) {
   const registry = registryOf(ctx)
-  if (!registry) throw new Error('当前版本不支持创建工作区，请手动选择已有文件夹。')
+  if (!registry || !registry.service) throw new Error('当前版本不支持创建工作区，请手动选择已有文件夹。')
 
   const target = resolve(requested && String(requested).trim() ? String(requested) : await defaultHomePath())
 
@@ -251,7 +299,15 @@ export async function adoptHome(ctx, root, requested) {
   }
 
   // create() 对同一路径是幂等的，重复调用不会产生第二条登记。
-  const workspace = await registry.create(target)
+  //
+  // 两种宿主形态的调用方式不同，必须分开：
+  //   workspaceController.create({ path }) → { workspace, created }（现代）
+  //   workspaceRegistry.create(path)       → workspace 本体  （旧）
+  // 早先统一传对象，回退路径直接 path.split 报错 —— 单元测试抓到的。
+  const outcome = registry.modern
+    ? await registry.service.create({ path: target })
+    : await registry.service.create(target)
+  const workspace = outcome && outcome.workspace ? outcome.workspace : outcome
   const workspaceId = String(workspace?.workspaceId || workspace?.id || '')
   const canonical = String(workspace?.path || target)
 
@@ -268,7 +324,12 @@ export async function adoptHome(ctx, root, requested) {
   // 本来就用目录名做默认标题，用户选的目录不需要我们插手。
   if (created && basename(canonical) === HOME_DIRECTORY) {
     try {
-      if (workspaceId && workspace?.title !== HOME_TITLE) await registry.rename(workspaceId, HOME_TITLE)
+      // controller 收 request 对象；旧 registry 收 (id, title)。
+      const service = registry.service
+      if (workspaceId && workspace?.title !== HOME_TITLE && typeof service.rename === 'function') {
+        if (registry.modern) await service.rename({ workspaceId, title: HOME_TITLE })
+        else await service.rename(workspaceId, HOME_TITLE)
+      }
     } catch { /* 改名失败不影响目录本身 */ }
   }
 

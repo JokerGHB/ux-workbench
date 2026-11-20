@@ -15,6 +15,7 @@
  */
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { readFileSync } from 'node:fs'
 import { mkdir, readFile, rename, unlink, writeFile, readdir, stat } from 'node:fs/promises'
 import { dirname, join, resolve, isAbsolute, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -39,7 +40,8 @@ import { RunAborted, createCheckpoint, createShouldStop } from './cancel.js'
 import { createProjectServers, projectLabel } from './project.js'
 import { listDirectory, readProjectFile, FilesError } from './files.js'
 import { SAMPLE_INSTANCES } from './templates.js'
-import { describeHome, adoptHome } from './workbench-home.mjs'
+import { describeHome, adoptHome, readHomeRecord } from './workbench-home.mjs'
+import { identitySection } from './agent-persona.mjs'
 
 export const name = 'dsh-ux-workbench'
 export const inject = ['connection', 'tools', 'systemPrompt']
@@ -51,10 +53,52 @@ const API = '/api/dsh-ux-workbench'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const DEMO_FILE = join(HERE, 'demo.html')
 
+/** 随包下发的技能：文件在 skills/ux-experience-check/SKILL.md。 */
+const SKILL_FILE = join(HERE, '..', 'skills', 'ux-experience-check', 'SKILL.md')
+const SKILL_DESCRIPTION = '在找茬工作台里做一次真实的体验检测并给出可执行结论。当用户要求测试、检查、扫描、审计一个网页或本地项目，反馈文字溢出、暗色没适配、按钮太小、点着不跟手、对比度低、键盘看不见焦点，或想复用上次的检测结论时使用。'
+const SKILL_WHEN_TO_USE = '用户说「测一下这个页面」「检查我的项目」「这个按钮文字溢出了」，或者需要一个页面在亮暗/多视口/展开状态下是否可用的结论。'
+
+/**
+ * 读技能正文。
+ *
+ * 读不到就返回空串（技能不登记），而不是抛错 —— 打包漏了文件不该让整个
+ * 工作台装不上。frontmatter 由宿主解析，这里只去掉它再交给 register。
+ */
+function readSkillMarkdown() {
+  try {
+    return readFileSync(SKILL_FILE, 'utf8').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim()
+  } catch {
+    return ''
+  }
+}
+
 const MAX_BODY_BYTES = 4 * 1024 * 1024
 const INSTANCES_FILE = 'instances.json'
 const RUNS_DIR = 'runs'
+
+/**
+ * 产物目录名。
+ *
+ * 按宿主（EasyWork）的规则，工作台产生的东西应该落在**用户自己选的那个
+ * 项目文件夹里**，而不是 AppData 深处 —— 内置的质量检测工作台就是这么做的：
+ * 它的 state.json 里记着 `docs/test-report.md`，那个文件确实在项目目录内。
+ *
+ * 用点前缀是为了不干扰用户的项目文件，也不会被 git status 当成源码。
+ */
+const ARTIFACT_DIR = '.ux-workbench'
+
 const MAX_RUNS = 60
+
+/**
+ * 结论报告目录名（在 .ux-workbench 下，和 runs 并列）。
+ *
+ * 「检测结果」和「这次测试说明了什么」是两件事：引擎只能给出测量事实，
+ * 判断和修法是 AI 写的。结论单独存一份，用户切走再回来还在。
+ */
+const REPORTS_DIR = 'reports'
+
+/** 结论报告条数上限：和运行记录同一个量级，再老的就该归档了。 */
+const MAX_REPORTS = 60
 
 /** 内置示例实例的 id：始终受删除保护，不依赖落盘时是否写过 builtin 标记。 */
 const SAMPLE_IDS = new Set(SAMPLE_INSTANCES.map((item) => item.id))
@@ -191,10 +235,33 @@ function sanitizeProjectPath(value) {
  * 内置浏览器是通过 /live 转发的，文档地址变成了工作台自己；
  * 若不注入 base，页面里的 /app.js、./main.css 会打到转发路由上，全部 404。
  */
-function injectBase(html, href) {
-  const tag = `<base href="${href}">`
+export function injectBase(html, href, restorePath = '') {
+  const tag = `<base href="${href}">${restorePath ? restoreLocationScript(restorePath) : ''}`
   if (/<head[^>]*>/i.test(html)) return html.replace(/<head([^>]*)>/i, `<head$1>${tag}`)
   return tag + html
+}
+
+/**
+ * 把 iframe 文档地址上的 pathname 还原成「用户真正想打开的那条路径」。
+ *
+ * /live 代理让文档同源（这是能操作 iframe DOM 的前提），代价是文档地址变成了
+ * /api/dsh-ux-workbench/live?u=...。对 hash 路由或静态页没影响，但纯 pathname
+ * 路由（按 location.pathname 分支渲染）的应用会把它当成未知路径，直接渲染 404 页。
+ *
+ * 所以在应用脚本执行之前，同步把地址改回目标路径：replaceState 同源可用、
+ * 不触发导航、不发 popstate，页面照常启动，路由读到的就是正确路径。
+ * base 已在前面解析完成（且是绝对地址），改地址不影响相对资源解析。
+ *
+ * 注意 path 必须以 "/" 开头（调用方传的是 URL 的 pathname + search），
+ * 拼到 location.origin 后面才是合法绝对地址。
+ */
+function restoreLocationScript(path) {
+  const literal = JSON.stringify(path).replace(/</g, '\\u003c')
+  // 必须拼成绝对地址再交给 replaceState：传相对路径时浏览器按 <base> 解析，
+  // 而 base 指向项目端口——那是另一个源，会直接抛 SecurityError，
+  // 又被 catch 吞掉，看起来「脚本明明注入了却毫无作用」。
+  // 用 location.origin 拼出来就一定落在文档自己的源上。
+  return `<script>(function(){try{history.replaceState(history.state,"",location.origin+${literal})}catch(e){}})();</script>`
 }
 
 function normalizeInstance(input, existing = null) {
@@ -632,8 +699,7 @@ async function readBody(request) {
  * 这里是「应用刚启动」。两个时机都需要 —— 只在写时清，就管不到
  * 手工恢复备份、改小上限、以及删掉一半记录又不再检测的情况。
  */
-async function pruneRuns(root) {
-  const runsDir = join(root, RUNS_DIR)
+async function pruneRuns(runsDir) {
   let files = []
   try {
     files = (await readdir(runsDir)).filter((f) => f.endsWith('.json'))
@@ -657,12 +723,57 @@ async function pruneRuns(root) {
 export function apply(ctx, config) {
   const root = resolve(config.root)
   const instancesFile = join(root, INSTANCES_FILE)
-  const runsDir = join(root, RUNS_DIR)
+
+  /**
+   * 当前该把检测产物写到哪。
+   *
+   * 规则跟宿主一致：**工作台文件夹在哪个项目里，产物就跟着那个项目走**。
+   *   - 已经认领了文件夹 → `<该文件夹>/.ux-workbench/runs`
+   *   - 还没认领          → 退回 `<root>/runs`（不能让记录无处可写）
+   *
+   * 每次读写都现算，而不是启动时算一次：用户完全可能在运行期间新建或
+   * 改选文件夹，缓存住就会一直写进旧位置。
+   */
+  async function runsDirectory() {
+    try {
+      const record = await readHomeRecord(root)
+      if (record && record.path) {
+        const dir = join(record.path, ARTIFACT_DIR, RUNS_DIR)
+        await mkdir(dir, { recursive: true })
+        return dir
+      }
+    } catch { /* 目录建不出来就退回兜底位置，不要让检测本身失败 */ }
+    // 兜底位置同样要建出来：还没认领文件夹时也不能写不进去。
+    const fallback = join(root, RUNS_DIR)
+    await mkdir(fallback, { recursive: true }).catch(() => {})
+    return fallback
+  }
+
+  /**
+   * AI 结论报告写到哪。
+   *
+   * 和 runs/ 同一套规则（跟着工作台文件夹走），但目录独立：
+   * 两者一起被「清空检测记录」误删就丢掉了人的判断，而那是重跑不回来的东西。
+   */
+  async function reportsDirectory() {
+    try {
+      const record = await readHomeRecord(root)
+      if (record && record.path) {
+        const dir = join(record.path, ARTIFACT_DIR, REPORTS_DIR)
+        await mkdir(dir, { recursive: true })
+        return dir
+      }
+    } catch { /* 同 runsDirectory：建不出来就退兜底 */ }
+    const fallback = join(root, REPORTS_DIR)
+    await mkdir(fallback, { recursive: true }).catch(() => {})
+    return fallback
+  }
 
   sweepTemporaries(root).catch(() => {})
   // 启动时也扫一遍行数上限：淘汰原来只在「新记录落盘」时触发，
   // 于是删一半、从备份恢复、或换了上限值之后，超出的记录会一直躺着。
-  pruneRuns(root).catch(() => {})
+  // 产物目录现在跟着工作区走，所以先把真实目录解析出来再清。
+  runsDirectory().then((dir) => pruneRuns(dir)).catch(() => {})
 
 
   // playwright-core 按需加载：装不上时工作台仍能打开，只是跑不了检测。
@@ -732,35 +843,55 @@ export function apply(ctx, config) {
 
   /* --- 运行记录 --- */
 
+  /**
+   * 待读的记录目录：工作区里的在前，全局旧位置在后。
+   *
+   * 产物改成跟随工作区之后，改造前那批记录还留在全局位置。只读新目录的话，
+   * 用户升级后会看到历史列表突然空了 —— 数据其实还在，只是换了地方。
+   * 两个位置都读，旧记录继续可见，新记录落在工作区。
+   * 同一 id 以工作区那份为准（排在前面，后面按 id 去重）。
+   */
+  async function runDirectories() {
+    const primary = await runsDirectory()
+    const legacy = join(root, RUNS_DIR)
+    return primary === legacy ? [primary] : [primary, legacy]
+  }
+
   async function listRuns(limit = 20) {
-    let files = []
-    try {
-      files = await readdir(runsDir)
-    } catch {
-      return []
-    }
+    const dirs = await runDirectories()
     const runs = []
-    for (const file of files) {
-      if (!file.endsWith('.json')) continue
-      const data = await readJson(join(runsDir, file), null)
-      if (!data) continue
+    const seen = new Set()
+    for (const runsDir of dirs) {
+      let files = []
+      try {
+        files = await readdir(runsDir)
+      } catch {
+        continue
+      }
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue
+        const data = await readJson(join(runsDir, file), null)
+        if (!data || !data.id) continue
+        if (seen.has(data.id)) continue
+        seen.add(data.id)
       runs.push({
-        id: data.id,
-        instanceId: data.instanceId,
-        instanceName: data.instanceName,
-        startedAt: data.startedAt,
-        finishedAt: data.finishedAt,
-        // 旧记录没有这个字段，用时间戳补算，保证每条历史都有耗时。
-        durationMs: elapsedOf(data),
-        ok: data.ok,
-        // aborted 也要带上：面板要区分「失败」和「用户自己停的」，
-        // 否则一次主动停止会被画成出错。
-        aborted: data.aborted === true,
-        error: data.error,
-        browser: data.browser,
-        summary: data.summary,
-        combinations: (data.combinations || []).map((c) => ({ label: c.label, issueCount: c.issueCount, error: c.error }))
-      })
+          id: data.id,
+          instanceId: data.instanceId,
+          instanceName: data.instanceName,
+          startedAt: data.startedAt,
+          finishedAt: data.finishedAt,
+          // 旧记录没有这个字段，用时间戳补算，保证每条历史都有耗时。
+          durationMs: elapsedOf(data),
+          ok: data.ok,
+          // aborted 也要带上：面板要区分「失败」和「用户自己停的」，
+          // 否则一次主动停止会被画成出错。
+          aborted: data.aborted === true,
+          error: data.error,
+          browser: data.browser,
+          summary: data.summary,
+          combinations: (data.combinations || []).map((c) => ({ label: c.label, issueCount: c.issueCount, error: c.error }))
+        })
+      }
     }
     runs.sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
     return runs.slice(0, limit)
@@ -769,7 +900,12 @@ export function apply(ctx, config) {
   async function readRun(id) {
     const safe = sanitizeId(id)
     if (!safe) throw new WorkbenchError('运行记录标识不合法。')
-    const data = await readJson(join(runsDir, `${safe}.json`), null)
+    // 先找工作区，再找旧的全局位置 —— 升级前那批记录还能打开。
+    let data = null
+    for (const runsDir of await runDirectories()) {
+      data = await readJson(join(runsDir, `${safe}.json`), null)
+      if (data) break
+    }
     if (!data) throw new WorkbenchError('运行记录不存在。', 404)
     // 旧记录没有 durationMs，这里补算，详情页也能显示耗时。
     return { ...data, durationMs: elapsedOf(data) }
@@ -785,12 +921,18 @@ export function apply(ctx, config) {
   async function deleteRun(id) {
     const safe = sanitizeId(id)
     if (!safe) throw new WorkbenchError('运行记录标识不合法。', 400)
-    try {
-      await unlink(join(runsDir, `${safe}.json`))
-    } catch (error) {
-      if (error && error.code === 'ENOENT') throw new WorkbenchError('运行记录不存在。', 404)
-      throw error
+    let removed = false
+    for (const runsDir of await runDirectories()) {
+      try {
+        await unlink(join(runsDir, `${safe}.json`))
+        removed = true
+        break
+      } catch (error) {
+        if (error && error.code === 'ENOENT') continue
+        throw error
+      }
     }
+    if (!removed) throw new WorkbenchError('运行记录不存在。', 404)
     return { id: safe }
   }
 
@@ -805,20 +947,23 @@ export function apply(ctx, config) {
    * 备份子目录），一律不碰。宁可少删，不要误删。
    */
   async function clearRuns() {
-    let files = []
-    try {
-      files = (await readdir(runsDir)).filter((f) => f.endsWith('.json'))
-    } catch (error) {
-      if (error && error.code === 'ENOENT') return { removed: 0 }
-      throw error
-    }
+    // 两个位置都要清：只清工作区会留下旧记录，用户点「清空」后发现还剩下几条。
     let removed = 0
-    for (const file of files) {
+    for (const runsDir of await runDirectories()) {
+      let files = []
       try {
-        await unlink(join(runsDir, file))
-        removed++
-      } catch {
-        // 单个删不掉（被占用、权限）不该中断整场清空
+        files = (await readdir(runsDir)).filter((f) => f.endsWith('.json'))
+      } catch (error) {
+        if (error && error.code === 'ENOENT') continue
+        throw error
+      }
+      for (const file of files) {
+        try {
+          await unlink(join(runsDir, file))
+          removed++
+        } catch {
+          // 单个删不掉（被占用、权限）不该中断整场清空
+        }
       }
     }
     return { removed }
@@ -831,6 +976,7 @@ export function apply(ctx, config) {
     // 但前者一个像素都没测到。存进去就等于留下一份「测过了、没问题」的假证据，
     // 而且会长期留在列表里骗人。这类结果只在当次的接口返回与面板错误里出现。
     if (run.blocked) return run
+    const runsDir = await runsDirectory()
     await writeJsonAtomic(join(runsDir, `${run.id}.json`), run)
     // 只保留最近 MAX_RUNS 条
     try {
@@ -849,6 +995,111 @@ export function apply(ctx, config) {
     } catch {
       // 清理失败不影响主流程
     }
+  }
+
+  /* --- AI 结论报告 --- */
+
+  /**
+   * 一份结论报告的形状。
+   *
+   * 只留渲染需要的东西：Markdown 正文、标题、归属（哪个页面/项目）、时间。
+   * 不把模型的原始回复整段塞进来 —— 面板要显示的是结论，不是对话记录。
+   */
+  function normalizeReport(input, existing = null) {
+    if (!input || typeof input !== 'object') throw new WorkbenchError('结论内容不合法。')
+    const markdown = typeof input.markdown === 'string' ? input.markdown.trim() : ''
+    if (!markdown) throw new WorkbenchError('结论正文不能是空的。')
+    // 正文上限：报告是给人读的，长到这个量级基本是误贴了整页 HTML。
+    if (markdown.length > 200_000) throw new WorkbenchError('结论正文过长（上限 200000 字符）。', 413)
+
+    const pick = (value, fallback = '', limit = 240) => {
+      const text = typeof value === 'string' ? value.trim() : ''
+      return text ? text.slice(0, limit) : fallback
+    }
+
+    return {
+      id: existing?.id || `rep-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      title: pick(input.title, firstHeading(markdown) || '体验检测结论', 160),
+      target: pick(input.target, '', 320),
+      instanceId: pick(input.instanceId, '', 80),
+      runId: pick(input.runId, '', 80),
+      summary: pick(input.summary, '', 200),
+      markdown,
+      createdAt: existing?.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }
+  }
+
+  /** 取 Markdown 第一个一级标题当报告标题，省得每次都要另填一个。 */
+  function firstHeading(markdown) {
+    const match = /^#\s+(.+)$/m.exec(String(markdown || ''))
+    return match ? match[1].trim().slice(0, 160) : ''
+  }
+
+  async function saveReport(report) {
+    const dir = await reportsDirectory()
+    await writeJsonAtomic(join(dir, `${report.id}.json`), report)
+    // 和运行记录一样按时间淘汰，避免目录无限长大
+    try {
+      const files = (await readdir(dir)).filter((f) => f.endsWith('.json'))
+      if (files.length > MAX_REPORTS) {
+        const detailed = []
+        for (const file of files) {
+          const data = await readJson(join(dir, file), null)
+          if (data) detailed.push({ file, createdAt: data.createdAt })
+        }
+        detailed.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+        for (const extra of detailed.slice(MAX_REPORTS)) {
+          await unlink(join(dir, extra.file)).catch(() => {})
+        }
+      }
+    } catch { /* 清理失败不影响保存 */ }
+    return report
+  }
+
+  async function listReports(limit = 20) {
+    const dirs = [await reportsDirectory()]
+    const legacy = join(root, REPORTS_DIR)
+    if (legacy !== dirs[0]) dirs.push(legacy)
+    const seen = new Set()
+    const list = []
+    for (const dir of dirs) {
+      let files = []
+      try {
+        files = await readdir(dir)
+      } catch {
+        continue
+      }
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue
+        const data = await readJson(join(dir, file), null)
+        if (!data || !data.id || seen.has(data.id)) continue
+        seen.add(data.id)
+        list.push({
+          id: data.id,
+          title: data.title,
+          target: data.target,
+          instanceId: data.instanceId,
+          runId: data.runId,
+          summary: data.summary,
+          createdAt: data.createdAt,
+          updatedAt: data.updatedAt,
+          // 列表页不需要全文，但给一个长度让界面能显示「共 N 字」
+          length: typeof data.markdown === 'string' ? data.markdown.length : 0
+        })
+      }
+    }
+    list.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+    return list.slice(0, limit)
+  }
+
+  async function readReport(id) {
+    const safe = sanitizeId(id)
+    if (!safe) throw new WorkbenchError('结论标识不合法。')
+    let data = await readJson(join(await reportsDirectory(), `${safe}.json`), null)
+    if (!data) data = await readJson(join(root, REPORTS_DIR, `${safe}.json`), null)
+    if (!data) throw new WorkbenchError('这份结论不存在了。', 404)
+    return data
   }
 
   /* --- 任务启动 --- */
@@ -1190,6 +1441,46 @@ export function apply(ctx, config) {
       }
     })
 
+    /**
+     * 当前正在跑的检测（不分发起方）。
+     *
+     * 「用户点按钮」和「AI 调 ux_run_check」都会登记 job，但面板原本只知道自己
+     * 点出来的那个 jobId（`busy = Boolean(jobId)`）。于是 AI 一开跑，面板是静止的：
+     * 没有转圈、没有秒数、按钮还写着「开始检测」——用户既看不出它在干活，
+     * 也可能再点一下。
+     *
+     * 这里让面板能问「现在有谁在跑」，然后挂到同一个 job 上：
+     * 进度、秒数、「停止」按钮全部复用现成的那一套，不需要另造一个界面。
+     */
+    register({
+      path: `${API}/job-active`,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      async fetch() {
+        try {
+          pruneJobs()
+          const running = []
+          for (const job of jobs.values()) {
+            if (job.status !== 'running') continue
+            running.push({
+              id: job.id,
+              instanceName: job.instanceName,
+              instanceId: job.instanceId || null,
+              url: job.url || '',
+              startedAt: job.startedAt,
+              elapsedMs: Date.now() - job.startedAt,
+              progress: job.progress || null
+            })
+          }
+          // 最晚开始的排前面：面板只需要接一个，取最近的那个最符合直觉
+          running.sort((a, b) => b.startedAt - a.startedAt)
+          return json({ ok: true, jobs: running })
+        } catch (error) {
+          return failure(error, '无法读取正在进行的检测。')
+        }
+      }
+    })
+
     // 停止一个正在跑的检测
     register({
       path: `${API}/job-stop`,
@@ -1243,6 +1534,63 @@ export function apply(ctx, config) {
           return json({ run: await readRun(String(url.searchParams.get('id') || '')) })
         } catch (error) {
           return failure(error, '无法读取运行详情。')
+        }
+      }
+    })
+
+    /* --- AI 结论报告 --- */
+
+    // 结论列表（面板「结论」区）
+    register({
+      path: `${API}/reports`,
+      methods: ['GET', 'POST', 'DELETE'],
+      requestBody: 'buffered',
+      async fetch(request) {
+        try {
+          if (request.method === 'GET') {
+            const url = new URL(request.url)
+            const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit')) || 20))
+            return json({ reports: await listReports(limit) })
+          }
+          if (request.method === 'DELETE') {
+            // 面板删除单份结论。正文是 AI 写的，删掉不会自己长回来，所以要问过用户。
+            const url = new URL(request.url)
+            const safe = sanitizeId(String(url.searchParams.get('id') || ''))
+            if (!safe) throw new WorkbenchError('结论标识不合法。')
+            let removed = false
+            for (const dir of [await reportsDirectory(), join(root, REPORTS_DIR)]) {
+              try {
+                await unlink(join(dir, `${safe}.json`))
+                removed = true
+                break
+              } catch (error) {
+                if (error && error.code === 'ENOENT') continue
+                throw error
+              }
+            }
+            if (!removed) throw new WorkbenchError('这份结论不存在了。', 404)
+            return json({ ok: true, id: safe })
+          }
+          const payload = await readBody(request)
+          const existing = payload?.id ? await readReport(payload.id).catch(() => null) : null
+          return json({ ok: true, report: await saveReport(normalizeReport(payload, existing)) })
+        } catch (error) {
+          return failure(error, '处理结论时出错。')
+        }
+      }
+    })
+
+    // 单份结论全文
+    register({
+      path: `${API}/report`,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      async fetch(request) {
+        try {
+          const url = new URL(request.url)
+          return json({ report: await readReport(String(url.searchParams.get('id') || '')) })
+        } catch (error) {
+          return failure(error, '读不到这份结论。')
         }
       }
     })
@@ -1487,8 +1835,10 @@ export function apply(ctx, config) {
           }
 
           let html = await upstream.text()
-          // base 必须指向真实服务，否则页面里的相对资源会打到本路由上
-          html = injectBase(html, target.href)
+          // base 必须指向真实服务，否则页面里的相对资源会打到本路由上。
+          // 同时把 iframe 文档地址还原成目标路径（含 search），否则纯 pathname
+          // 路由的应用会把代理地址当成未知路径，直接渲染自己的 404 页。
+          html = injectBase(html, target.href, `${target.pathname}${target.search}`)
 
           return new Response(html, {
             status: upstream.status,
@@ -1786,7 +2136,11 @@ export function apply(ctx, config) {
 
         let run
         try {
-          run = await executeRun(target, info, { chromium, signal: controller.signal })
+          // 和 launchJob 一样把阶段写进 job：面板接上这个任务后要显示
+          // 「正在探测主题 / 正在展开状态」这些文字，否则只有一个转圈。
+          run = await executeRun(target, info, { chromium, signal: controller.signal }, (progress) => {
+            job.progress = progress
+          })
           await saveRun(run)
           // 已经被叫停的任务不要覆盖成 done：停止不是完成。
           job.status = run.aborted || controller.signal.aborted ? 'aborted' : (run.ok ? 'done' : 'failed')
@@ -1876,8 +2230,84 @@ export function apply(ctx, config) {
       }
     }))
 
+    register(defineTool({
+      name: 'ux_save_report',
+      description: 'Write your conclusion back into the UX workbench so the user can read it in the panel. This is the required last step after testing: the tool run record only holds measurements, while what you judged and how to fix it belongs here. Never finish a check with the conclusion living only in the chat. Provide Markdown; the first "# heading" becomes the title.',
+      parameters: {
+        markdown: { type: 'string', required: true, description: 'The conclusion as Markdown: what was tested, findings with severity and location, and how to fix each one.' },
+        title: { type: 'string', description: 'Short report title. Defaults to the first Markdown heading.' },
+        summary: { type: 'string', description: 'One-line verdict shown in the report list, e.g. "通过 3 项，遗留 2 处对比度问题".' },
+        target: { type: 'string', description: 'Which page or project this conclusion is about (URL or folder path).' },
+        instanceId: { type: 'string', description: 'Workbench instance id, when the check ran on a registered project.' },
+        runId: { type: 'string', description: 'The run id returned by ux_run_check, to tie the conclusion to that measurement.' },
+        id: { type: 'string', description: 'Existing report id to overwrite instead of creating a new one.' }
+      },
+      output: textOutput(),
+      async execute(args) {
+        const existing = args?.id ? await readReport(String(args.id)).catch(() => null) : null
+        const report = await saveReport(normalizeReport(args, existing))
+        // 不要说「面板能看到」：结论区已经从面板上去掉了，结论只在对话里读。
+        // 说错会让 AI 之后跟用户讲一个不存在的界面。
+        return `结论已存档：「${report.title}」（id=${report.id}）${existing ? '（已更新原结论）' : ''}。`
+          + `\n用 ux_list_reports 可以再读回来，便于对比「修了没有」。`
+      }
+    }))
+
+    register(defineTool({
+      name: 'ux_list_reports',
+      description: 'List conclusions already saved in the UX workbench, newest first. Use it to check whether this page was tested before, or to answer "上次测完是什么结论".',
+      parameters: {
+        limit: { type: 'number', description: 'How many to return, default 10.' }
+      },
+      output: textOutput(),
+      async execute(args) {
+        const limit = Math.min(50, Math.max(1, Number(args?.limit) || 10))
+        const reports = await listReports(limit)
+        if (!reports.length) return '工作台里还没有任何结论报告。测完用 ux_save_report 写一份。'
+        return reports.map((item) => {
+          const where = item.target ? `\n  对象：${item.target}` : ''
+          const run = item.runId ? `\n  关联运行：${item.runId}` : ''
+          return `- ${item.title}（id=${item.id}）\n  ${item.createdAt}${item.summary ? `：${item.summary}` : ''}${where}${run}`
+        }).join('\n')
+      }
+    }))
+
     return () => {}
   }, 'ux-workbench: agent tools')
+
+  /**
+   * 会话身份：只在属于本工作台的会话里渲染。
+   *
+   * 没有这一步，工作台里新建的会话拿到的是一张白纸 —— 模型看得到工具，
+   * 却不知道自己处在工作台里、该主动开场、该把结论写回工作台。
+   */
+  ctx.effect(() => ctx.systemPrompt.section(identitySection(root)), 'ux-workbench: identity')
+
+  /**
+   * 随插件下发的技能：装上就有，不需要用户自己去技能目录里放文件。
+   *
+   * `skills` 是宿主的可选服务（老版本没有），所以用 ctx.inject 探测 ——
+   * 缺了只是少一个技能，工作台其它功能照常。
+   */
+  ctx.inject(['skills'], (scoped) => {
+    scoped.effect(() => {
+      const content = readSkillMarkdown()
+      if (!content) return () => {}
+      try {
+        return scoped.skills.register({
+          name: 'ux-experience-check',
+          description: SKILL_DESCRIPTION,
+          whenToUse: SKILL_WHEN_TO_USE,
+          source: 'bundled',
+          content
+        })
+      } catch (error) {
+        // 同名技能已存在、宿主版本不认这个字段 —— 都不能让插件装载失败。
+        console.warn(`[dsh-ux-workbench] 技能登记失败：${(error && error.message) || error}`)
+        return () => {}
+      }
+    }, 'ux-workbench: skill')
+  })
 
   ctx.systemPrompt.section({
     name: 'tool:ux-workbench',
@@ -1897,6 +2327,7 @@ export function apply(ctx, config) {
       'This workbench detects experience defects that have no functional oracle: text overflow past a container, tap targets below 44px, light-colored blocks left behind in dark mode,',
       'contrast below the WCAG threshold, invisible keyboard focus, slow interaction feedback, and animation frame drops.',
       'When the user says a button text overflows, the dark theme still has light modules, or interaction feels not smooth, prefer ux_run_check over guessing.',
+      'After a check, call ux_save_report to write the conclusion back into the workbench — the run record only stores measurements, and a conclusion left only in the chat is gone once the user switches sessions.',
       'Do not ask the user to pick a template or set thresholds: the page is measured against a defined standard, not against a per-project profile.'
     ].join(' ')
   })

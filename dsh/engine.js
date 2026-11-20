@@ -155,14 +155,64 @@ const PAGE_HELPERS = `
       h: Math.round(r.height)
     };
   }
-  function __lum(color) {
+  function __parseColor(color) {
     const m = String(color).match(/rgba?\\(([^)]+)\\)/);
     if (!m) return null;
     const p = m[1].split(',').map(Number);
-    const a = p.length > 3 ? p[3] : 1;
-    if (a < 0.05) return null;
+    return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+  }
+  function __relLum(r, g, b) {
     const f = (v) => { const s = v / 255; return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4); };
-    return 0.2126 * f(p[0]) + 0.7152 * f(p[1]) + 0.0722 * f(p[2]);
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+  }
+  /**
+   * 元素的「真实」背景色。
+   *
+   * 直接拿 getComputedStyle(el).backgroundColor 算亮度是错的：页面上大量元素用的是
+   * rgba(255,255,255,.08) 这类半透明白，其 RGB 分量是 255（算出来亮度 1.0，等同纯白），
+   * 但它叠在深色底上合成后接近黑色。按分量算会把「深色底上的轻微高光」全部报成
+   * 「暗色模式亮色残留」—— 实测一个页面 6 条 darkLeak 全是这么来的。
+   * 必须逐层向上做 alpha 合成，直到遇到不透明层。
+   *
+   * 渐变背景没有单一颜色，无法用单色亮度判定，返回 gradient 让调用方跳过而不是瞎猜。
+   */
+  function __realBg(el) {
+    const layers = [];
+    let cur = el;
+    while (cur && cur.nodeType === 1) {
+      const cs = getComputedStyle(cur);
+      const bgImg = cs.backgroundImage;
+      if (bgImg && bgImg !== 'none' && bgImg.indexOf('gradient') !== -1) {
+        return { gradient: bgImg.slice(0, 80) };
+      }
+      const c = __parseColor(cs.backgroundColor);
+      if (c && c.a > 0) {
+        layers.push(c);
+        if (c.a >= 1) break;
+      }
+      cur = cur.parentElement;
+    }
+    let base = [255, 255, 255];
+    if (layers.length && layers[layers.length - 1].a >= 1) {
+      const L = layers[layers.length - 1];
+      base = [L.r, L.g, L.b];
+    }
+    for (let i = layers.length - 2; i >= 0; i--) {
+      const L = layers[i];
+      base = [0, 1, 2].map((k) => [L.r, L.g, L.b][k] * L.a + base[k] * (1 - L.a));
+    }
+    return { rgb: base.map((v) => Math.round(v)) };
+  }
+  /** 相对亮度。传 el 时按真实合成背景算（渐变返回 null）；否则按给定颜色算。 */
+  function __lum(color, el) {
+    if (el) {
+      const bg = __realBg(el);
+      if (bg.gradient || !bg.rgb) return null;
+      return __relLum(bg.rgb[0], bg.rgb[1], bg.rgb[2]);
+    }
+    const c = __parseColor(color);
+    if (!c || c.a < 0.05) return null;
+    return __relLum(c.r, c.g, c.b);
   }
 `
 
@@ -196,34 +246,87 @@ export async function detectHorizontalScroll(page, opts = {}) {
       // 自己开了横向滚动的容器是「局部滚动」，是有意为之，不算页面横向溢出
       if (cs.overflowX === 'auto' || cs.overflowX === 'scroll') continue;
       const parent = el.parentElement;
-      const parentOverhang = parent ? parent.getBoundingClientRect().right - clientWidth : 0;
-      // 只留「比父级更外扩」的：父级也被撑宽时，源头在父级
-      if (parent && parentOverhang >= overhang - 1) continue;
+      // 只和「有布局意义的」父级比。
+      // body / html 永远跟着内容变宽，拿它们当父级会把每个元素都判成
+      // 「父级也被撑宽 → 源头在上面」，最后一层层跳过去只剩 html/body 可报。
+      const meaningfulParent = parent && parent !== document.body && parent !== document.documentElement
+        ? parent
+        : null;
+      const parentOverhang = meaningfulParent ? meaningfulParent.getBoundingClientRect().right - clientWidth : 0;
+      /**
+       * 谁才是源头？
+       *
+       * 父级和它一样宽，说明是**它**把父级撑开的 —— 它才是源头，不能排除。
+       * 反过来，父级比它更外扩，说明父级还被别的东西撑着，源头在父级，
+       * 这时才跳过它。
+       *
+       * 早先写成「父级也超了就跳过」，方向正好反了：
+       * <main><pre> 里 pre 撑宽 main，结果 pre 被排除、只报 main，
+       * 而 main 自己没写任何宽度，用户对着它无从下手。
+       */
+      if (meaningfulParent && parentOverhang > overhang + 1) continue;
       culprits.push({
         selector: __path(el),
         label: __label(el),
         rect: __rect(el),
         width: Math.round(r.width),
         overhang: Math.round(overhang),
+        // 真实 DOM 深度：排序时用来在「超出量相同」的情况下挑最内层。
+        // 不能用选择器里的 '>' 个数推，两条路径的起始层级可能不同。
+        depth: (() => { let d = 0; let node = el; while (node && node !== document.documentElement) { d++; node = node.parentElement } return d })(),
         css: (() => {
           // 说清楚「凭什么这么宽」，用户才知道改哪一行。
           //
           // 注意 getComputedStyle().width 永远返回已解析的像素值，不会等于
-          // 'auto' —— 所以不能拿它判断「有没有写死宽度」，否则 min-width 和
-          // nowrap 撑开的元素都会被误报成 width: 1100px。
-          // 先判真正起约束作用的那条，最后才退回 width。
+          // 'auto' —— 不能拿它判断「有没有写死宽度」，否则被内容撑开的容器
+          // 会被误报成 width: 4638px 这种计算值。
+          // 作者真写下的 width 要去样式表里找（内联或 CSS 规则）。
           const hasText = (el.textContent || '').trim().length > 0
           if (cs.whiteSpace === 'nowrap' && hasText) return 'white-space: nowrap'
           if (cs.minWidth && cs.minWidth !== 'auto' && cs.minWidth !== '0px') return 'min-width: ' + cs.minWidth
           if (cs.position === 'absolute' || cs.position === 'fixed') return 'position: ' + cs.position
-          const inlineWidth = el.style && el.style.width
-          if (inlineWidth) return 'width: ' + inlineWidth
-          if (r.width >= clientWidth) return 'width: ' + Math.round(r.width) + 'px'
+
+          const authoredWidth = (() => {
+            if (el.style && el.style.width) return el.style.width
+            // 找匹配该元素的规则里最后一条 width 声明。
+            // 只读 CSSOM，不解析样式表文本 —— 更准，也不受注释干扰。
+            let found = ''
+            for (const sheet of Array.from(document.styleSheets)) {
+              let rules
+              try { rules = sheet.cssRules } catch { continue } // 跨域样式表读不到，跳过
+              const walk = (list) => {
+                for (const rule of Array.from(list || [])) {
+                  // 分组规则（@media / @supports）要进去找。
+                  // 注意：普通 CSSStyleRule 上也有 cssRules（新版 Chromium 给空列表），
+                  // 只判它存不存在，会把每条普通规则都当成组 ——
+                  // 递归一个空列表然后 continue，width 永远读不出来。
+                  if (rule.cssRules && rule.cssRules.length) { walk(rule.cssRules); continue }
+                  if (!rule.selectorText || !rule.style) continue
+                  const width = rule.style.getPropertyValue('width')
+                  if (!width) continue
+                  try { if (el.matches(rule.selectorText)) found = width } catch { /* 选择器不合法，跳过 */ }
+                }
+              }
+              walk(rules)
+            }
+            return found
+          })()
+
+          // 只有这个宽度确实等于或超过视口，它才是「撑宽页面」的原因；
+          // 一个 width:100px 的按钮不会把页面撑开。
+          if (authoredWidth) {
+            const px = parseFloat(authoredWidth)
+            const isAbsolutePx = /px$/.test(authoredWidth) && Number.isFinite(px)
+            if (!isAbsolutePx || px >= clientWidth) return 'width: ' + authoredWidth
+          }
           return ''
         })()
       });
     }
-    culprits.sort((a, b) => b.overhang - a.overhang);
+    // 排序：先看超出量（越大越可疑），超出量相同时取 DOM 更深的那个。
+    // 深度很重要 —— <main><pre> 里两者一样宽，但 pre 是把 main 撑开的那个，
+    // 报 main 等于让用户去改一个自己没写宽度的容器。
+    culprits.sort((a, b) => (b.overhang - a.overhang) || (b.depth - a.depth));
     return {
       scrollWidth: docScrollWidth,
       clientWidth,
@@ -276,6 +379,53 @@ export async function detectOverflow(page, opts = {}) {
       const ox = el.scrollWidth > el.clientWidth + 1;
       const oy = el.scrollHeight > el.clientHeight + 1;
       if (!ox && !oy) continue;
+
+      /**
+       * scrollWidth 变大不等于「文字溢出」。
+       *
+       * 按钮上贴了绝对定位的「新」角标（右上角小图）时，scrollWidth 会被撑大
+       * 二十来像素，而按钮里的文字其实完完整整在自己的盒子里 —— 报「文字溢出容器
+       * 边界」是错的，那枚角标本来就要画到外面。实测「创空间」按钮：文字右边界
+       * 721px、按钮右边界 736px，文字没超，纯粹是角标把 scrollWidth 撑到了 91。
+       *
+       * 判据：用 Range 拿真实文字矩形，逐一看它有没有越过内容盒。
+       * 文字没越界、且把盒子撑大的是绝对定位/固定定位子元素，那就不是文字溢出。
+       */
+      const textOverflows = (() => {
+        const er0 = el.getBoundingClientRect();
+        // padding box 作边界：边框内的 padding 区域是文字可以合法占据的
+        const right = er0.left + el.clientLeft + el.clientWidth;
+        const bottom = er0.top + el.clientTop + el.clientHeight;
+        const tw = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        let node, hit = false;
+        while ((node = tw.nextNode())) {
+          if (!(node.textContent || '').trim()) continue;
+          const range = document.createRange();
+          range.selectNodeContents(node);
+          for (const r of Array.from(range.getClientRects())) {
+            if (r.width <= 0 && r.height <= 0) continue;
+            if (r.right > right + 1 || r.bottom > bottom + 1) { hit = true; break; }
+          }
+          if (hit) break;
+        }
+        return hit;
+      })();
+
+      if (!textOverflows) {
+        // 文字没越界。若撑大盒子的是普通文档流子元素，仍值得报（会压邻元素）；
+        // 但绝对/固定定位子元素是刻意的徽标、装饰，不算缺陷。
+        const er1 = el.getBoundingClientRect();
+        const pr = er1.left + el.clientLeft + el.clientWidth;
+        const pb = er1.top + el.clientTop + el.clientHeight;
+        const flowChildOverflow = Array.from(el.children).some((c) => {
+          const ccs = getComputedStyle(c);
+          if (ccs.position === 'absolute' || ccs.position === 'fixed') return false;
+          const cr = c.getBoundingClientRect();
+          return cr.right > pr + 1 || cr.bottom > pb + 1;
+        });
+        if (!flowChildOverflow) continue;
+      }
+
       const clipsX = cs.overflowX !== 'visible';
       const clipsY = cs.overflowY !== 'visible';
       const ellipsis = cs.textOverflow === 'ellipsis';
@@ -344,7 +494,17 @@ export async function detectTapTarget(page, opts = {}) {
       const width = Math.round(r.width), height = Math.round(r.height);
       // 任意一边低于舒适尺寸就收集，判定分档放在下面做，页面里只负责量
       if (width >= ${comfortable} && height >= ${comfortable}) continue;
-      out.push({ label: __label(el), selector: __path(el), rect: __rect(el), tag: el.tagName.toLowerCase(), width, height, inline: getComputedStyle(el).display === 'inline' });
+      const ecs = getComputedStyle(el);
+      out.push({
+        label: __label(el), selector: __path(el), rect: __rect(el),
+        tag: el.tagName.toLowerCase(), width, height,
+        inline: ecs.display === 'inline',
+        // 纯文字目标 vs 图标目标：前者尺寸被字号和行高约束，后者应当有足够热区。
+        textLen: (el.textContent || '').trim().length,
+        hasMedia: Boolean(el.querySelector('img, svg, canvas, video')),
+        lineHeight: parseFloat(ecs.lineHeight) || 0,
+        fontSize: parseFloat(ecs.fontSize) || 0
+      });
     }
     return out;
   })()`)
@@ -354,7 +514,30 @@ export async function detectTapTarget(page, opts = {}) {
   return raw
     .map((item) => {
       const smallest = Math.min(item.width, item.height)
-      const isError = smallest < minSize
+
+      /**
+       * 分级，而不是一律按 24px 判「严重」。
+       *
+       * 实测一个正常官网首页，15 条「严重」里有 6 条是页脚导航链接（高 23px）和
+       * 两行备案号（高 20px）—— 尺寸由字号和行高决定，离 24px 硬底线只差几像素，
+       * 却和 8×8 的轮播圆点并列成「严重」，报告立刻失去可信度。
+       *
+       * 判据：
+       *   纯文字目标（有文字、无图片/SVG），高度≈行高  → 尺寸被排版约束，
+       *     只在「明显小于」硬底线时才算缺陷，差几像素记为提示。
+       *   图标/圆点类目标（无文字或有媒体）            → 热区就是它唯一的存在，
+       *     低于硬底线是真缺陷，保持严重。
+       */
+      // 只要带有真实文字就是文字目标，哪怕旁边还有一枚徽标图标 ——
+      // 「公安备案」那种「图标 + 文字」的页脚链接仍是靠文字命中，不能因为
+      // 有图标就退回 24px 硬底线。纯图标/纯圆点（无文字）才严格判定。
+      const textOnly = item.textLen >= 2
+      const lineConstrained = textOnly
+        && item.lineHeight > 0
+        && item.height <= item.lineHeight + 6
+      // 文字目标给 4px 容差：23px、20px 这种贴着行高的链接不算「命中困难」
+      const effectiveMin = lineConstrained ? Math.max(minSize - 4, 16) : minSize
+      const isError = smallest < effectiveMin
       if (!isError && item.tag === 'a' && item.inline) return null
       return {
         kind: 'tapTarget',
@@ -362,12 +545,14 @@ export async function detectTapTarget(page, opts = {}) {
         title: `「${item.label || item.selector}」点击区域 ${item.width}×${item.height}px`,
         detail: isError
           ? `小于硬底线 ${minSize}×${minSize}px，触摸设备上很难准确命中，属于可访问性缺陷。`
-          : `低于${touch ? '触屏' : '桌面'}舒适尺寸 ${comfortable}×${comfortable}px（未触及 ${minSize}px 硬底线），仍可点击，但精密操作或手指命中会吃力。`,
+          : lineConstrained
+            ? `纯文字目标，高度 ${item.height}px 由字号/行高决定，低于${touch ? '触屏' : '桌面'}舒适尺寸 ${comfortable}px，但不影响点击命中（WCAG 2.5.8 对行内文字有豁免）。仅作提示。`
+            : `低于${touch ? '触屏' : '桌面'}舒适尺寸 ${comfortable}×${comfortable}px（未触及 ${minSize}px 硬底线），仍可点击，但精密操作或手指命中会吃力。`,
         target: item.selector,
         suggestion: isError
           ? `把可点击区域扩展到至少 ${minSize}×${minSize}px；触屏为主时建议 ${touchComfortable}×${touchComfortable}px，可用 padding 扩热区而不改视觉尺寸。`
           : `有余力时把热区补到 ${comfortable}×${comfortable}px（padding 或 ::after 覆盖层均可），视觉尺寸不必变。`,
-        metrics: { ...item, minSize, comfortable, touch }
+        metrics: { ...item, minSize, comfortable, touch, lineConstrained, effectiveMin }
       }
     })
     .filter(Boolean)
@@ -386,11 +571,19 @@ export async function detectDarkLeak(page, opts = {}) {
       const r = el.getBoundingClientRect();
       const area = r.width * r.height;
       if (area < ${minArea}) continue;
-      const lum = __lum(cs.backgroundColor);
-      if (lum === null || lum <= ${threshold}) continue;
+      // 只关心「自己画了背景」的元素；自身完全透明的不该由它背锅，
+      // 真正的亮色底会在祖先那层被量到。
+      const own = __parseColor(cs.backgroundColor);
+      if (!own || own.a < 0.05) continue;
+      // 关键：按合成后的真实颜色判亮度，不能按 rgba 的分量判。
+      const bg = __realBg(el);
+      if (bg.gradient || !bg.rgb) continue;
+      const lum = __relLum(bg.rgb[0], bg.rgb[1], bg.rgb[2]);
+      if (lum <= ${threshold}) continue;
       out.push({
         label: __label(el), selector: __path(el), rect: __rect(el),
         background: cs.backgroundColor,
+        composited: 'rgb(' + bg.rgb.join(', ') + ')',
         luminance: Number(lum.toFixed(3)),
         area: Math.round(area)
       });
@@ -425,6 +618,7 @@ export async function detectContrast(page, opts = {}) {
     ${PAGE_HELPERS}
     function ratio(a, b) { return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05); }
     const out = [];
+    let skippedGradient = 0;
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node, count = 0;
     while ((node = walker.nextNode()) && count < 800) {
@@ -433,28 +627,33 @@ export async function detectContrast(page, opts = {}) {
       const el = node.parentElement;
       if (!el || !__visible(el)) continue;
       const cs = getComputedStyle(el);
-      const fgLum = __lum(cs.color);
-      if (fgLum === null) continue;
-      let bgLum = 1, cur = el;
-      while (cur) {
-        const l = __lum(getComputedStyle(cur).backgroundColor);
-        if (l !== null) { bgLum = l; break; }
-        cur = cur.parentElement;
-      }
+      // 前景可能是半透明的（rgba(255,255,255,.96)），先算真实背景，
+      // 再把前景按 alpha 合成上去，否则「白字叠深底」会被当成「白字叠白底」。
+      const bg = __realBg(el);
+      // 渐变背景没有单一底色，单色对比度无从谈起。跳过并计数，
+      // 不拿 255 当兜底 —— 那会把深色渐变上的白字报成 1.0:1。
+      if (bg.gradient || !bg.rgb) { skippedGradient++; continue; }
+      const bgLum = __relLum(bg.rgb[0], bg.rgb[1], bg.rgb[2]);
+      const fg = __parseColor(cs.color);
+      if (!fg) continue;
+      const fgRgb = fg.a >= 1
+        ? [fg.r, fg.g, fg.b]
+        : [0, 1, 2].map((k) => [fg.r, fg.g, fg.b][k] * fg.a + bg.rgb[k] * (1 - fg.a));
+      const fgLum = __relLum(fgRgb[0], fgRgb[1], fgRgb[2]);
       const cr = ratio(fgLum, bgLum);
       if (cr < ${minRatio}) {
-        out.push({ text: text.slice(0, 40), selector: __path(el), rect: __rect(el), color: cs.color, ratio: Number(cr.toFixed(2)), fontSize: cs.fontSize });
+        out.push({ text: text.slice(0, 40), selector: __path(el), rect: __rect(el), color: cs.color, background: 'rgb(' + bg.rgb.join(', ') + ')', ratio: Number(cr.toFixed(2)), fontSize: cs.fontSize });
       }
       count++;
     }
-    return out;
+    return { out, skippedGradient };
   })()`)
 
-  return raw.slice(0, 40).map((item) => ({
+  return raw.out.slice(0, 40).map((item) => ({
     kind: 'contrast',
     severity: item.ratio < 2 ? 'error' : 'warn',
     title: `「${item.text}」对比度仅 ${item.ratio}:1`,
-    detail: `前景 ${item.color}，字号 ${item.fontSize}，低于阈值 ${minRatio}:1。`,
+    detail: `前景 ${item.color} 叠在 ${item.background} 上，字号 ${item.fontSize}，低于阈值 ${minRatio}:1。`,
     target: item.selector,
     suggestion: '加深正文颜色或提亮背景，正文建议 ≥4.5:1，大字 ≥3:1。',
     metrics: item

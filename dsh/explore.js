@@ -213,12 +213,43 @@ export async function stateFingerprint(page) {
 async function captureInteractionMetrics(page) {
   return page.evaluate(() => {
     const elements = [...document.querySelectorAll('button, input, textarea, select, [role="button"], [role="alert"], [aria-live]')]
+    /**
+     * 生成稳定的结构路径（只用标签 + 同名兄弟序号，不含会随状态变化的祖先 class）。
+     * 作用是把「文字相同的两个不同元素」区分开 —— 只靠文本会撞 key。
+     */
+    const pathOf = (el) => {
+      const parts = []
+      let cur = el
+      // 走到根，不设层数上限：截断到固定层数会让不同分区的同构结构生成同一个路径
+      // （实测第 4 层截断后，三个不同 section 里的 article>div>button 仍然撞车）。
+      while (cur && cur.nodeType === 1) {
+        if (cur.id) { parts.unshift(cur.tagName.toLowerCase() + '#' + cur.id); break }
+        const parent = cur.parentElement
+        let seg = cur.tagName.toLowerCase()
+        if (parent) {
+          // 用「同名兄弟中的序号」，且不依赖 class —— class 会随状态变（active/开合类），
+          // 拿它做身份会让同一个元素在交互前后变成两个 key。
+          const same = Array.from(parent.children).filter((c) => c.tagName === cur.tagName)
+          if (same.length > 1) seg += ':nth-of-type(' + (same.indexOf(cur) + 1) + ')'
+        }
+        parts.unshift(seg)
+        cur = cur.parentElement
+      }
+      return parts.join('>')
+    }
     // 必须用「文档绝对坐标」而不是 getBoundingClientRect 的视口坐标：
     // 交互前我们会把元素滚进视口，滚动位置一变，视口坐标就整体平移，
     // 那会被误判成「页面发生了 500px 抖动」。加上滚动量换算成绝对坐标后，
     // 位移才真的反映元素在页面里的位置变化。
     const scrollX = window.scrollX || window.pageXOffset || 0
     const scrollY = window.scrollY || window.pageYOffset || 0
+    // 全文档元素序号：作为兜底消歧，保证每个盒子拿到唯一 key。
+    const docIndex = new Map()
+    const all = document.querySelectorAll('*')
+    for (let i = 0; i < all.length; i++) docIndex.set(all[i], i)
+
+    const usedKeys = new Map()
+
     return {
       scrollWidth: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
       clientWidth: document.documentElement.clientWidth,
@@ -234,7 +265,18 @@ async function captureInteractionMetrics(page) {
           if (getComputedStyle(cur).position === 'fixed') { anchored = true; break }
         }
         return {
-          key: `${el.tagName.toLowerCase()}::${el.id || label}`,
+          // key 必须能区分「同名不同位置」的元素。
+          // 早先用 tag::文本，页首导航的「首页」和页脚导航的「首页」会撞成同一个 key，
+          // 于是把两个相距 6129px 的不同按钮当成「同一个元素移动了 6129px」，
+          // 报出一堆根本不存在的布局跳动。加上 DOM 路径段后二者才可区分。
+          key: (() => {
+            // 首选「标签#id」或结构路径；若仍与先前的盒子重名（页面里确实存在
+            // 结构完全对称的两处），再挂上全文档序号 —— 唯一性不能靠运气。
+            const base = `${el.tagName.toLowerCase()}::${el.id || pathOf(el) || label}`
+            const n = (usedKeys.get(base) || 0) + 1
+            usedKeys.set(base, n)
+            return n === 1 ? base : `${base}#${docIndex.get(el)}`
+          })(),
           label,
           x: Math.round(r.x + (anchored ? 0 : scrollX)),
           y: Math.round(r.y + (anchored ? 0 : scrollY)),
