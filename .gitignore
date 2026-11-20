@@ -17,3 +17,6 @@ src/
 # æ­£å¼æµ‹è¯•åœ¨ test/ ä¸‹ã€‚
 .test-*.mjs
 .verify-ui-failed.mjs
+# ±¾µØÑéÖ¤½Å±¾£¨º¬±¾»ú¾ø¶ÔÂ·¾¶£¬²»½ø²Ö¿â£©
+.server.mjs
+.verify-notice.mjs
