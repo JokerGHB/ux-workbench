@@ -100,6 +100,26 @@ const REPORTS_DIR = 'reports'
 /** 结论报告条数上限：和运行记录同一个量级，再老的就该归档了。 */
 const MAX_REPORTS = 60
 
+/**
+ * 功能测试报告目录名（在 .ux-workbench 下，和 runs / reports 并列）。
+ *
+ * 为什么不和 reports/ 共用目录、加一个 testType 字段区分：
+ * 过滤是靠「每条读取路径都记得加条件」维持的，漏一处两类报告就混在一起，
+ * 而混在一起正是这个工作台最不该犯的错 —— 一份「通过 12/失败 3」的功能报告
+ * 出现在「体验缺陷 0 处」的位置上，读起来就是「这个页面没毛病」。
+ * 分成两个目录之后，体验那条链路**物理上读不到**功能报告。
+ */
+const FUNCTIONAL_DIR = 'functional-reports'
+
+/** 功能报告条数上限：比检测记录宽松一点，一份报告就是一次完整的验收。 */
+const MAX_FUNCTIONAL_REPORTS = 60
+
+/** 单个用例允许带多少条证据（截图/日志/接口响应）。 */
+const MAX_EVIDENCE = 12
+
+/** 一次功能测试最多收多少个用例 —— 再多的应该在报告正文里分组，不必全进结构。 */
+const MAX_CASES = 200
+
 /** 内置示例实例的 id：始终受删除保护，不依赖落盘时是否写过 builtin 标记。 */
 const SAMPLE_IDS = new Set(SAMPLE_INSTANCES.map((item) => item.id))
 
@@ -769,6 +789,27 @@ export function apply(ctx, config) {
     return fallback
   }
 
+  /**
+   * 功能测试报告写到哪。
+   *
+   * 和上面两个同一套「跟着工作台文件夹走」的规则，目录名独立。
+   * 关键点是**不复用 reportsDirectory()**：两条链路只要共用一次解析函数，
+   * 之后任何一处「顺手把参数改一下」都会让两类报告落进同一个目录。
+   */
+  async function functionalDirectory() {
+    try {
+      const record = await readHomeRecord(root)
+      if (record && record.path) {
+        const dir = join(record.path, ARTIFACT_DIR, FUNCTIONAL_DIR)
+        await mkdir(dir, { recursive: true })
+        return dir
+      }
+    } catch { /* 同 runsDirectory：建不出来就退兜底 */ }
+    const fallback = join(root, FUNCTIONAL_DIR)
+    await mkdir(fallback, { recursive: true }).catch(() => {})
+    return fallback
+  }
+
   sweepTemporaries(root).catch(() => {})
   // 启动时也扫一遍行数上限：淘汰原来只在「新记录落盘」时触发，
   // 于是删一半、从备份恢复、或换了上限值之后，超出的记录会一直躺着。
@@ -1100,6 +1141,218 @@ export function apply(ctx, config) {
     if (!data) data = await readJson(join(root, REPORTS_DIR, `${safe}.json`), null)
     if (!data) throw new WorkbenchError('这份结论不存在了。', 404)
     return data
+  }
+
+  /* --- 功能测试报告 --- */
+
+  /**
+   * 一份功能测试报告的形状。
+   *
+   * 和体验结论的差别不只是多了几个字段，而是**判断单位不同**：
+   * 体验结论的单位是「一处缺陷」，功能报告的单位是「一个用例的通过/失败/阻塞」。
+   * 所以这里必须收下 cases[]，否则面板只能退化成渲染一大段 Markdown，
+   * 用户想知道「哪几条挂了」就得自己在正文里找。
+   *
+   * 但 cases 不是必需的：AI 有时只会交一份正文。这时报告依然成立，
+   * 面板自动降级成「全文渲染」而不是报错 —— 因为内容本身是有价值的，
+   * 不该因为格式没对齐就把它丢掉。
+   */
+  function normalizeFunctionalReport(input) {
+    if (!input || typeof input !== 'object') throw new WorkbenchError('功能测试报告内容不合法。')
+
+    const markdown = typeof input.markdown === 'string' ? input.markdown.trim() : ''
+    if (!markdown) throw new WorkbenchError('报告正文不能是空的。')
+    if (markdown.length > 200_000) throw new WorkbenchError('报告正文过长（上限 200000 字符）。', 413)
+
+    const pick = (value, fallback = '', limit = 240) => {
+      const text = typeof value === 'string' ? value.trim() : ''
+      return text ? text.slice(0, limit) : fallback
+    }
+
+    // 结论只有一个来源：用例算出来的和 AI 写的不一致时，以用例为准。
+    // 反过来就会出现「结论条写着通过、下面全是失败用例」的报告。
+    const cases = Array.isArray(input.cases)
+      ? input.cases
+        .filter((item) => item && typeof item === 'object')
+        .slice(0, MAX_CASES)
+        .map((item, index) => normalizeFunctionalCase(item, index))
+      : []
+
+    return {
+      id: `fn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      // 正文里也带一份：报告被导出、贴到别处时，页眉能说清这是哪一种测试。
+      testType: 'functional',
+      title: pick(input.title, firstHeading(markdown) || '功能测试报告', 160),
+      projectPath: pick(input.projectPath, '', 400),
+      projectName: pick(input.projectName, '', 160),
+      url: pick(input.url, '', 400),
+      instanceName: pick(input.instanceName, '', 160),
+      summary: pick(input.summary, '', 300),
+      verdict: normalizeVerdict(input.verdict, cases),
+      counts: countCases(cases),
+      cases,
+      markdown,
+      // 记下是哪一档测试，面板据此显示「标准 / 完整」这类标签。
+      mode: pick(input.mode, '', 40),
+      skill: pick(input.skill, 'ai-harness-testing', 80),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }
+  }
+
+  /** 一个用例：名字、状态、严重度、步骤、预期、实际、证据。 */
+  function normalizeFunctionalCase(input, index) {
+    const text = (value, limit = 400) => (typeof value === 'string' ? value.trim().slice(0, limit) : '')
+
+    const steps = Array.isArray(input.steps)
+      ? input.steps
+        .map((step) => (typeof step === 'string' ? step.trim() : text(step?.text, 400)))
+        .filter(Boolean)
+        .slice(0, 40)
+      : []
+
+    const evidence = Array.isArray(input.evidence)
+      ? input.evidence
+        .filter((item) => item && typeof item === 'object')
+        .slice(0, MAX_EVIDENCE)
+        .map((item) => ({
+          type: ['image', 'text', 'url', 'log'].includes(item.type) ? item.type : 'text',
+          label: text(item.label, 120),
+          value: text(item.value, 4000)
+        }))
+        .filter((item) => item.value)
+      : []
+
+    return {
+      id: text(input.id, 80) || `case-${index + 1}`,
+      name: text(input.name, 200) || `用例 ${index + 1}`,
+      status: normalizeCaseStatus(input.status),
+      severity: normalizeSeverity(input.severity),
+      steps,
+      expected: text(input.expected, 2000),
+      actual: text(input.actual, 2000),
+      note: text(input.note, 1000),
+      evidence
+    }
+  }
+
+  /**
+   * 用例状态。认不出来的状态一律当「阻塞」，不是「通过」。
+   *
+   * 这是刻意的：写错的字段更可能出现在一个没跑顺的用例上，
+   * 归成「通过」会把一次没验证的事情记成验证过了 —— 这就是假绿。
+   */
+  function normalizeCaseStatus(value) {
+    const text = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    if (['pass', 'passed', 'ok', 'success', '通过'].includes(text)) return 'pass'
+    if (['fail', 'failed', 'failure', 'error', '失败'].includes(text)) return 'fail'
+    if (['skip', 'skipped', 'ignored', '跳过'].includes(text)) return 'skip'
+    if (['blocked', 'pending', 'block', '阻塞', '未测'].includes(text)) return 'blocked'
+    return 'blocked'
+  }
+
+  /** 严重度：只影响排序与配色，不影响结论对不对。 */
+  function normalizeSeverity(value) {
+    const text = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    if (['blocker', 'fatal', '致命'].includes(text)) return 'blocker'
+    if (['critical', 'severe', '严重'].includes(text)) return 'critical'
+    if (['minor', 'trivial', 'low', '轻微'].includes(text)) return 'minor'
+    return 'major'
+  }
+
+  /** 总判定：有用例失败就是失败，有阻塞没有失败就是阻塞，全通过才算通过。 */
+  function normalizeVerdict(value, cases) {
+    const text = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    if (['pass', 'passed', '通过'].includes(text)) return 'passed'
+    if (['fail', 'failed', '失败'].includes(text)) return 'failed'
+    if (['blocked', '阻塞'].includes(text)) return 'blocked'
+    return deriveVerdict(cases)
+  }
+
+  function deriveVerdict(cases) {
+    if (!cases.length) return 'passed'
+    if (cases.some((item) => item.status === 'fail')) return 'failed'
+    if (cases.some((item) => item.status === 'blocked')) return 'blocked'
+    return 'passed'
+  }
+
+  function countCases(cases) {
+    const counts = { total: cases.length, pass: 0, fail: 0, blocked: 0, skip: 0 }
+    for (const item of cases) {
+      if (counts[item.status] !== undefined) counts[item.status] += 1
+    }
+    return counts
+  }
+
+  async function saveFunctionalReport(report) {
+    const dir = await functionalDirectory()
+    await writeJsonAtomic(join(dir, `${report.id}.json`), report)
+    try {
+      const files = (await readdir(dir)).filter((f) => f.endsWith('.json'))
+      if (files.length > MAX_FUNCTIONAL_REPORTS) {
+        const detailed = []
+        for (const file of files) {
+          const data = await readJson(join(dir, file), null)
+          if (data) detailed.push({ file, createdAt: data.createdAt })
+        }
+        detailed.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+        for (const extra of detailed.slice(MAX_FUNCTIONAL_REPORTS)) {
+          await unlink(join(dir, extra.file)).catch(() => {})
+        }
+      }
+    } catch { /* 清理失败不影响保存 */ }
+    return report
+  }
+
+  async function listFunctionalReports(limit = 20) {
+    const dir = await functionalDirectory()
+    let files = []
+    try {
+      files = (await readdir(dir)).filter((f) => f.endsWith('.json'))
+    } catch {
+      return []
+    }
+    const list = []
+    for (const file of files) {
+      const data = await readJson(join(dir, file), null)
+      if (!data || !data.id) continue
+      list.push({
+        id: data.id,
+        testType: 'functional',
+        title: data.title,
+        projectName: data.projectName,
+        projectPath: data.projectPath,
+        url: data.url,
+        summary: data.summary,
+        verdict: data.verdict,
+        counts: data.counts,
+        mode: data.mode,
+        createdAt: data.createdAt,
+        length: typeof data.markdown === 'string' ? data.markdown.length : 0
+      })
+    }
+    list.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+    return list.slice(0, limit)
+  }
+
+  async function readFunctionalReport(id) {
+    const safe = sanitizeId(id)
+    if (!safe) throw new WorkbenchError('报告标识不合法。')
+    const data = await readJson(join(await functionalDirectory(), `${safe}.json`), null)
+    if (!data) throw new WorkbenchError('这份功能测试报告不存在了。', 404)
+    return data
+  }
+
+  async function deleteFunctionalReport(id) {
+    const safe = sanitizeId(id)
+    if (!safe) throw new WorkbenchError('报告标识不合法。')
+    try {
+      await unlink(join(await functionalDirectory(), `${safe}.json`))
+    } catch (error) {
+      if (error && error.code === 'ENOENT') throw new WorkbenchError('这份报告不存在了。', 404)
+      throw error
+    }
+    return { id: safe }
   }
 
   /* --- 任务启动 --- */
@@ -1591,6 +1844,51 @@ export function apply(ctx, config) {
           return json({ report: await readReport(String(url.searchParams.get('id') || '')) })
         } catch (error) {
           return failure(error, '读不到这份结论。')
+        }
+      }
+    })
+
+    /* --- 功能测试报告 ---
+     *
+     * 四条路由，全部挂在 /functional/ 下，和上面体验结论的 /reports、/report
+     * 互不相通。不从体验路由派生（比如 /reports?type=functional）是刻意的：
+     * 那样两条链路共用一次参数解析，将来谁改一下默认值就会串数据。
+     */
+
+    register({
+      path: `${API}/functional/reports`,
+      methods: ['GET', 'POST', 'DELETE'],
+      requestBody: 'buffered',
+      async fetch(request) {
+        try {
+          if (request.method === 'GET') {
+            const url = new URL(request.url)
+            const limit = Math.min(60, Math.max(1, Number(url.searchParams.get('limit')) || 20))
+            return json({ reports: await listFunctionalReports(limit) })
+          }
+          if (request.method === 'DELETE') {
+            const url = new URL(request.url)
+            return json({ ok: true, ...(await deleteFunctionalReport(String(url.searchParams.get('id') || ''))) })
+          }
+          const payload = await readBody(request)
+          return json({ ok: true, report: await saveFunctionalReport(normalizeFunctionalReport(payload)) })
+        } catch (error) {
+          return failure(error, '处理功能测试报告时出错。')
+        }
+      }
+    })
+
+    // 单份功能报告全文（含 cases 明细）
+    register({
+      path: `${API}/functional/report`,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      async fetch(request) {
+        try {
+          const url = new URL(request.url)
+          return json({ report: await readFunctionalReport(String(url.searchParams.get('id') || '')) })
+        } catch (error) {
+          return failure(error, '读不到这份功能测试报告。')
         }
       }
     })
@@ -2232,7 +2530,7 @@ export function apply(ctx, config) {
 
     register(defineTool({
       name: 'ux_save_report',
-      description: 'Write your conclusion back into the UX workbench so the user can read it in the panel. This is the required last step after testing: the tool run record only holds measurements, while what you judged and how to fix it belongs here. Never finish a check with the conclusion living only in the chat. Provide Markdown; the first "# heading" becomes the title.',
+      description: 'Write an EXPERIENCE check conclusion (is the page usable: overflow, tap targets, dark-mode leftovers, contrast, focus, feedback latency, frame drops) into the Bug Hunt workbench. This is NOT the functional test result — functional pass/fail-by-case reports belong to ux_save_function_report, never here. This is the required last step after an experience check: the run record only holds measurements, while what you judged and how to fix it belongs here. Provide Markdown; the first "# heading" becomes the title.',
       parameters: {
         markdown: { type: 'string', required: true, description: 'The conclusion as Markdown: what was tested, findings with severity and location, and how to fix each one.' },
         title: { type: 'string', description: 'Short report title. Defaults to the first Markdown heading.' },
@@ -2246,9 +2544,11 @@ export function apply(ctx, config) {
       async execute(args) {
         const existing = args?.id ? await readReport(String(args.id)).catch(() => null) : null
         const report = await saveReport(normalizeReport(args, existing))
-        // 不要说「面板能看到」：结论区已经从面板上去掉了，结论只在对话里读。
-        // 说错会让 AI 之后跟用户讲一个不存在的界面。
+        // 结论只在对话里读，面板不画第二份 —— 面板主区已经被测量结果占着，
+// 再塞一份判断会让人分不清哪个是测出来的、哪个是评出来的。
+        // 所以这里不能承诺「面板里能看到」，只能说存档了、能读回来。
         return `结论已存档：「${report.title}」（id=${report.id}）${existing ? '（已更新原结论）' : ''}。`
+          + `\n体验结论不在面板里重复展示：用户在这一轮对话里读到，就是它出现的地方。`
           + `\n用 ux_list_reports 可以再读回来，便于对比「修了没有」。`
       }
     }))
@@ -2268,6 +2568,56 @@ export function apply(ctx, config) {
           const where = item.target ? `\n  对象：${item.target}` : ''
           const run = item.runId ? `\n  关联运行：${item.runId}` : ''
           return `- ${item.title}（id=${item.id}）\n  ${item.createdAt}${item.summary ? `：${item.summary}` : ''}${where}${run}`
+        }).join('\n')
+      }
+    }))
+
+    register(defineTool({
+      name: 'ux_save_function_report',
+      description: 'Write a FUNCTIONAL test conclusion (does the feature actually work: cases with expected vs actual, pass/fail/blocked) into the Bug Hunt workbench panel. This is NOT the experience check — never use ux_save_report for functional results, and never use this tool for overflow/contrast/tap-target findings. Functional testing itself is done with the ai-harness-testing skill; this tool only stores the structured result so the panel can render it. Provide markdown for the full report; cases[] is preferred but optional (when omitted the panel falls back to rendering the markdown alone).',
+      parameters: {
+        markdown: { type: 'string', required: true, description: 'The full report as Markdown: scope, what was executed, evidence-based verdict, and fixes.' },
+        title: { type: 'string', description: 'Short report title. Defaults to the first Markdown heading.' },
+        summary: { type: 'string', description: 'One-line verdict for the report list, e.g. "通过 12 失败 3 阻塞 1".' },
+        verdict: { type: 'string', description: 'Overall verdict: passed | failed | blocked. Derived from cases when omitted.' },
+        projectName: { type: 'string', description: 'Project name under test.' },
+        projectPath: { type: 'string', description: 'Absolute folder path of the project under test.' },
+        url: { type: 'string', description: 'URL under test, when the project is served locally.' },
+        mode: { type: 'string', description: 'Test depth used by the skill, e.g. 核心 | 标准 | 完整.' },
+        cases: {
+          type: 'array',
+          description: 'Structured case results. Each: { name, status: pass|fail|blocked|skip, severity: blocker|critical|major|minor, steps: string[], expected, actual, note, evidence: [{type: image|text|url|log, label, value}] }.'
+        }
+      },
+      output: textOutput(),
+      async execute(args) {
+        const report = await saveFunctionalReport(normalizeFunctionalReport(args))
+        const counts = report.counts
+        const verdictText = { passed: '全部通过', failed: '存在失败用例', blocked: '有阻塞未验证' }[report.verdict]
+        return `功能测试报告已写进工作台面板：「${report.title}」（id=${report.id}）。\n`
+          + `结论：${verdictText}。用例 ${counts.total} 个 —— 通过 ${counts.pass}，失败 ${counts.fail}，阻塞 ${counts.blocked}${counts.skip ? `，跳过 ${counts.skip}` : ''}。\n`
+          + '用户现在能在面板的「功能测试」模式里看到这份报告。用 ux_list_function_reports 可以再读回来对比。'
+      }
+    }))
+
+    register(defineTool({
+      name: 'ux_list_function_reports',
+      description: 'List FUNCTIONAL test reports already saved in the Bug Hunt workbench, newest first. Use it to answer "上次功能测试什么结论" or to check whether this project was functionally verified before. These are the functional reports only — experience conclusions are listed by ux_list_reports.',
+      parameters: {
+        limit: { type: 'number', description: 'How many to return, default 10.' }
+      },
+      output: textOutput(),
+      async execute(args) {
+        const limit = Math.min(50, Math.max(1, Number(args?.limit) || 10))
+        const reports = await listFunctionalReports(limit)
+        if (!reports.length) return '工作台里还没有任何功能测试报告。功能测试做完后用 ux_save_function_report 写一份。'
+        const verdictText = { passed: '通过', failed: '失败', blocked: '阻塞' }
+        return reports.map((item) => {
+          const where = item.projectPath || item.url
+          const counts = item.counts
+            ? `\n  用例：通过 ${item.counts.pass} / 失败 ${item.counts.fail} / 阻塞 ${item.counts.blocked}`
+            : ''
+          return `- ${item.title}（id=${item.id}）\n  ${item.createdAt} · ${verdictText[item.verdict] || item.verdict}${item.summary ? `：${item.summary}` : ''}${where ? `\n  对象：${where}` : ''}${counts}`
         }).join('\n')
       }
     }))
